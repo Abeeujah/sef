@@ -1,0 +1,9 @@
+[package]
+name = "sef"
+version = "0.1.0"
+authors = ["Abeeujah <abeeujah@gmail.com>"]
+repository = "https://github.com/abeeujah/sef"
+description = "A Secure Fountain Architecture for Slashing Storage Costs in Blockchains"
+edition = "2024"
+
+[dependencies]
