@@ -7,3 +7,5 @@ description = "A Secure Fountain Architecture for Slashing Storage Costs in Bloc
 edition = "2024"
 
 [dependencies]
+rand = "0.8"
+rand_chacha = "0.3"
