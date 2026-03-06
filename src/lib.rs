@@ -1,3 +1,4 @@
+pub mod chain;
 pub mod decoder;
 pub mod distribution;
 pub mod droplet;
