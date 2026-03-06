@@ -1,3 +1,4 @@
+pub mod decoder;
 pub mod distribution;
 pub mod droplet;
 pub mod encode;
