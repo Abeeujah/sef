@@ -76,11 +76,11 @@ pub fn peeling_check(k: usize, droplets: &[Vec<u32>]) -> PeelResult {
                 continue;
             }
             degree[ref_di] -= 1;
-            if degree[ref_di] == 1 {
-                if let Some(&surviving) = droplets[ref_di].iter().find(|&&x| !decoded[x as usize]) {
-                    last_block[ref_di] = surviving;
-                    queue.push_back(ref_di);
-                }
+            if degree[ref_di] == 1
+                && let Some(&surviving) = droplets[ref_di].iter().find(|&&x| !decoded[x as usize])
+            {
+                last_block[ref_di] = surviving;
+                queue.push_back(ref_di);
             }
         }
     }
@@ -142,9 +142,9 @@ pub trait BlockVerifier {
     ///
     /// # Returns
     /// - `Ok(length)`: The integrity check passed; returns the size of the
-    ///    actual data (excluding any trailing zero-padding).
+    ///   actual data (excluding any trailing zero-padding).
     /// - `Err(VerifyError)`: The data is corrupted or does not match the
-    ///    expected block for this index.
+    ///   expected block for this index.
     fn verify_and_len(&self, block_idx: u32, candidate: &[u8]) -> Result<usize, VerifyError>;
 }
 
@@ -349,8 +349,8 @@ pub fn peeling_decode(
     }
 
     let mut failures = Vec::new();
-    for i in 0..k {
-        if decoded[i].is_none() {
+    for (i, dec) in decoded.iter().enumerate().take(k) {
+        if dec.is_none() {
             let referenced_by = block_to_droplets
                 .get(&(i as u32))
                 .map(|v| v.iter().filter(|&&di| !droplet_disabled[di]).count())

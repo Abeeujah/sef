@@ -79,7 +79,7 @@ impl RobustSoliton {
 
         // Calculate unnormalized values and total sum (beta)
         let mut pmf = vec![0.0f64; k + 1];
-        for d in 1..=k {
+        for (d, pf) in pmf.iter_mut().enumerate().take(k + 1).skip(1) {
             let rho = if d == 1 {
                 1.0 / k_f
             } else {
@@ -95,8 +95,8 @@ impl RobustSoliton {
                 0.0
             };
 
-            pmf[d] = rho + theta;
-            sum_rho_plus_theta += pmf[d];
+            *pf = rho + theta;
+            sum_rho_plus_theta += *pf;
         }
 
         // Normalize and build CDF
@@ -209,7 +209,7 @@ mod tests {
 
         for _ in 0..10_000 {
             let d = dist.sample_degree(&mut rng, k);
-            assert!(d >= 1 && d <= 100, "degree {} out of range", d);
+            assert!((1..=100).contains(&d), "degree {} out of range", d);
         }
     }
 
