@@ -33,6 +33,20 @@ pub fn xor_into(buf: &mut Vec<u8>, block: &[u8]) {
     }
 }
 
+/// XOR src into a fixed-size destination without resizing.
+///
+/// Returns `false` if `src` is longer than `dst` (caller should treat as error).
+/// Used during peeling decode where payload growth indicates a malformed droplet.
+pub fn xor_into_fixed(dst: &mut [u8], src: &[u8]) -> bool {
+    if src.len() > dst.len() {
+        return false;
+    }
+    for (d, &s) in dst[..src.len()].iter_mut().zip(src.iter()) {
+        *d ^= s;
+    }
+    true
+}
+
 /// XORs multiple byte slices together with adaptive zero-padding.
 ///
 /// Each slice is XOR'd into the result. If slices have different lengths,

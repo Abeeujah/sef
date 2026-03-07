@@ -4,6 +4,7 @@ use std::{
 };
 
 use bitcoin::consensus::deserialize_partial;
+use sha2::{Digest, Sha256};
 
 use crate::{droplet::Droplet, xor};
 
@@ -175,7 +176,48 @@ impl BlockVerifier for BitcoinBlockVerifier {
             });
         }
 
+        if candidate[used..].iter().any(|&b| b != 0) {
+            return Err(VerifyError::NonZeroPadding);
+        }
+
         Ok(used)
+    }
+}
+
+/// Verifier for symbol-mode decoding: checks SHA256 hash of each symbol against the manifest.
+pub struct SymbolVerifier<'a> {
+    pub symbol_size: usize,
+    pub symbol_hashes: &'a [[u8; 32]],
+}
+
+impl BlockVerifier for SymbolVerifier<'_> {
+    fn verify_and_len(&self, block_idx: u32, candidate: &[u8]) -> Result<usize, VerifyError> {
+        let expected = self.symbol_hashes.get(block_idx as usize).ok_or_else(|| {
+            VerifyError::Deserialize(format!("symbol index {} out of range", block_idx))
+        })?;
+
+        let got: [u8; 32] = Sha256::new().chain_update(candidate).finalize().into();
+        if got != *expected {
+            return Err(VerifyError::HashMismatch {
+                block_idx,
+                expected: expected
+                    .iter()
+                    .map(|b| format!("{:02x}", b))
+                    .collect::<String>(),
+                got: got.iter().map(|b| format!("{:02x}", b)).collect::<String>(),
+            });
+        }
+
+        if candidate.len() != self.symbol_size {
+            return Err(VerifyError::Deserialize(format!(
+                "symbol {} has length {}, expected {}",
+                block_idx,
+                candidate.len(),
+                self.symbol_size
+            )));
+        }
+
+        Ok(self.symbol_size)
     }
 }
 
@@ -238,7 +280,7 @@ pub struct DecodeResult {
 impl DecodeResult {
     /// Returns `true` if every source block in the epoch was recovered.
     pub fn is_success(&self) -> bool {
-        self.decoded_count == self.k
+        self.decoded_count == self.k && self.stop_reason == DecodeStopReason::Completed
     }
 }
 
@@ -262,59 +304,71 @@ pub fn peeling_decode(
 ) -> DecodeResult {
     let n = droplets.len();
 
-    // Split droplets into indices and payloads for in-place mutation
-    let mut droplet_indices: Vec<Vec<u32>> = Vec::with_capacity(n);
+    // Split droplets into degree/xor-index and payloads for in-place mutation
+    let mut remaining_degree: Vec<u32> = Vec::with_capacity(n);
+    let mut xor_index: Vec<u32> = Vec::with_capacity(n);
     let mut droplet_payloads: Vec<Vec<u8>> = Vec::with_capacity(n);
-    let mut droplet_disabled: Vec<bool> = vec![false; n];
-
-    for d in droplets {
-        droplet_indices.push(d.indices);
-        droplet_payloads.push(d.payload);
-    }
+    let mut droplet_disabled: Vec<bool> = Vec::with_capacity(n);
 
     // Block index -> list of droplet indices that reference it
     let mut block_to_droplets: HashMap<u32, Vec<usize>> = HashMap::new();
-    for (di, indices) in droplet_indices.iter().enumerate() {
-        for &idx in indices {
-            block_to_droplets.entry(idx).or_default().push(di);
+
+    for d in droplets {
+        // Validate droplet structure: sorted unique indices in range, payload matches padded_len
+        if d.validate(k as u32).is_err() {
+            droplet_disabled.push(true);
+            remaining_degree.push(0);
+            xor_index.push(0);
+            droplet_payloads.push(d.payload);
+            continue;
         }
+        droplet_disabled.push(false);
+        let deg = d.indices.len() as u32;
+        let xor = d.indices.iter().fold(0u32, |acc, &x| acc ^ x);
+        for &idx in &d.indices {
+            block_to_droplets
+                .entry(idx)
+                .or_default()
+                .push(remaining_degree.len());
+        }
+        remaining_degree.push(deg);
+        xor_index.push(xor);
+        droplet_payloads.push(d.payload);
     }
 
     // Queue of singleton droplets
     let mut queue: VecDeque<usize> = VecDeque::new();
-    for (di, indices) in droplet_indices.iter().enumerate() {
-        if indices.len() == 1 {
+    for di in 0..remaining_degree.len() {
+        if remaining_degree[di] == 1 {
             queue.push_back(di);
         }
     }
 
     let mut decoded: Vec<Option<Vec<u8>>> = (0..k).map(|_| None).collect();
-    let mut decoded_count = 0usize;
-    let mut iterations = 0usize;
-    let mut verify_failures = 0usize;
+    let mut decoded_count = 0;
+    let mut iterations = 0;
+    let mut verify_failures = 0;
 
     while let Some(di) = queue.pop_front() {
-        if droplet_disabled[di] || droplet_indices[di].len() != 1 {
+        if droplet_disabled[di] || remaining_degree[di] != 1 {
             continue;
         }
 
-        let block_idx = droplet_indices[di][0];
+        let block_idx = xor_index[di];
         if decoded[block_idx as usize].is_some() {
             continue;
         }
 
-        // Take the payload
         let candidate = std::mem::take(&mut droplet_payloads[di]);
-
-        // Verify and determine true block length
         match verifier.verify_and_len(block_idx, &candidate) {
             Ok(true_len) => {
-                let block_bytes = candidate[..true_len].to_vec();
-                decoded[block_idx as usize] = Some(block_bytes.clone());
+                let mut block_bytes = candidate;
+                block_bytes.truncate(true_len);
                 decoded_count += 1;
                 iterations += 1;
 
                 if decoded_count == k {
+                    decoded[block_idx as usize] = Some(block_bytes);
                     break;
                 }
 
@@ -324,22 +378,27 @@ pub fn peeling_decode(
                         if ref_di == di || droplet_disabled[ref_di] {
                             continue;
                         }
-                        // XOR the block bytes into the droplet payload
-                        // The block_bytes may be shorter than the payload (adaptive padding)
-                        xor::xor_into(&mut droplet_payloads[ref_di], &block_bytes);
+                        // XOR the recovered block out of the droplet payload.
+                        // block_bytes may be shorter (adaptive padding); must not be longer.
+                        if !xor::xor_into_fixed(&mut droplet_payloads[ref_di], &block_bytes) {
+                            // Recovered block is longer than residual payload — malformed droplet
+                            droplet_disabled[ref_di] = true;
+                            continue;
+                        }
 
-                        // Remove this block index from the droplet
-                        droplet_indices[ref_di].retain(|&x| x != block_idx);
+                        remaining_degree[ref_di] -= 1;
+                        xor_index[ref_di] ^= block_idx;
 
-                        // If it became a singleton, add to queue
-                        if droplet_indices[ref_di].len() == 1 {
+                        if remaining_degree[ref_di] == 1 {
                             queue.push_back(ref_di);
                         }
                     }
                 }
+
+                decoded[block_idx as usize] = Some(block_bytes);
             }
             Err(_e) => {
-                // Verification failed - disable this droplet and continue
+                // Verification failed — disable this droplet and continue
                 droplet_disabled[di] = true;
                 verify_failures += 1;
                 // Put the payload back in case another droplet can solve this block
@@ -348,9 +407,10 @@ pub fn peeling_decode(
         }
     }
 
+    // Build failure analysis for undecoded blocks
     let mut failures = Vec::new();
-    for (i, dec) in decoded.iter().enumerate().take(k) {
-        if dec.is_none() {
+    for i in 0..k {
+        if decoded[i].is_none() {
             let referenced_by = block_to_droplets
                 .get(&(i as u32))
                 .map(|v| v.iter().filter(|&&di| !droplet_disabled[di]).count())
@@ -642,5 +702,148 @@ mod tests {
         // Blocks 2, 3, 4 should be in failures
         let failed_indices: Vec<u32> = result.failures.iter().map(|f| f.index).collect();
         assert_eq!(failed_indices, vec![2, 3, 4]);
+    }
+
+    #[test]
+    fn test_roundtrip_encode_decode_rsd() {
+        use crate::distribution::RobustSoliton;
+        use crate::droplet::{Encoder, EpochParams};
+
+        let k = 20;
+        let blocks = make_test_blocks(k);
+        let dist = RobustSoliton::new(k, 0.1, 0.5);
+        let params = EpochParams::new(0, k as u32, [42u8; 32]);
+        let encoder = Encoder::new(&params, &dist, &blocks);
+
+        // Generate enough droplets for reliable decoding
+        let droplets = encoder.generate_n(k as u64 * 5);
+
+        let verifier = ExactVerifier {
+            expected: blocks.clone(),
+        };
+        let result = peeling_decode(k, droplets, &verifier);
+        assert!(
+            result.is_success(),
+            "RSD round-trip failed: decoded {}/{}",
+            result.decoded_count,
+            k
+        );
+        for (i, block) in result.blocks.iter().enumerate() {
+            assert_eq!(block.as_ref().unwrap(), &blocks[i]);
+        }
+    }
+
+    #[test]
+    fn test_adversarial_droplet_rejected() {
+        let blocks = make_test_blocks(3);
+        // Provide valid singletons for blocks 1 and 2
+        // Inject a corrupted singleton for block 0
+        let mut corrupted = blocks[0].clone();
+        corrupted[0] ^= 0xFF; // flip a byte
+
+        let droplets = vec![
+            Droplet {
+                epoch_id: 0,
+                droplet_id: 0,
+                indices: vec![0],
+                padded_len: corrupted.len() as u32,
+                payload: corrupted,
+            },
+            Droplet {
+                epoch_id: 0,
+                droplet_id: 1,
+                indices: vec![0],
+                padded_len: blocks[0].len() as u32,
+                payload: blocks[0].clone(),
+            },
+            Droplet {
+                epoch_id: 0,
+                droplet_id: 2,
+                indices: vec![1],
+                padded_len: blocks[1].len() as u32,
+                payload: blocks[1].clone(),
+            },
+            Droplet {
+                epoch_id: 0,
+                droplet_id: 3,
+                indices: vec![2],
+                padded_len: blocks[2].len() as u32,
+                payload: blocks[2].clone(),
+            },
+        ];
+
+        let verifier = ExactVerifier {
+            expected: blocks.clone(),
+        };
+        let result = peeling_decode(3, droplets, &verifier);
+        assert!(result.is_success());
+        assert!(result.verify_failures >= 1);
+        for (i, block) in result.blocks.iter().enumerate() {
+            assert_eq!(block.as_ref().unwrap(), &blocks[i]);
+        }
+    }
+
+    #[test]
+    fn test_all_verify_failures() {
+        struct RejectAllVerifier;
+        impl BlockVerifier for RejectAllVerifier {
+            fn verify_and_len(&self, idx: u32, _candidate: &[u8]) -> Result<usize, VerifyError> {
+                Err(VerifyError::HashMismatch {
+                    block_idx: idx,
+                    expected: "expected".into(),
+                    got: "got".into(),
+                })
+            }
+        }
+
+        let blocks = make_test_blocks(3);
+        let droplets: Vec<Droplet> = blocks
+            .iter()
+            .enumerate()
+            .map(|(i, b)| Droplet {
+                epoch_id: 0,
+                droplet_id: i as u64,
+                indices: vec![i as u32],
+                padded_len: b.len() as u32,
+                payload: b.clone(),
+            })
+            .collect();
+
+        let result = peeling_decode(3, droplets, &RejectAllVerifier);
+        assert!(!result.is_success());
+        assert_eq!(result.decoded_count, 0);
+        assert_eq!(result.verify_failures, 3);
+        assert_eq!(result.stop_reason, DecodeStopReason::Stalled);
+    }
+
+    #[test]
+    fn test_out_of_range_droplet_skipped() {
+        let blocks = make_test_blocks(3);
+        let mut droplets: Vec<Droplet> = blocks
+            .iter()
+            .enumerate()
+            .map(|(i, b)| Droplet {
+                epoch_id: 0,
+                droplet_id: i as u64,
+                indices: vec![i as u32],
+                padded_len: b.len() as u32,
+                payload: b.clone(),
+            })
+            .collect();
+        // Add a droplet with out-of-range index
+        droplets.push(Droplet {
+            epoch_id: 0,
+            droplet_id: 99,
+            indices: vec![999],
+            padded_len: 4,
+            payload: vec![0; 4],
+        });
+
+        let verifier = ExactVerifier {
+            expected: blocks.clone(),
+        };
+        let result = peeling_decode(3, droplets, &verifier);
+        assert!(result.is_success());
+        assert_eq!(result.decoded_count, 3);
     }
 }

@@ -1,128 +1,65 @@
-use std::io::{self, Read, Write};
+use std::io::{self};
+
+use bitcoin::{
+    VarInt,
+    consensus::{Decodable, Encodable, encode},
+};
 
 use crate::droplet::Droplet;
 
-/// Magic bytes identifying our file format.
-const MAGIC: &[u8; 4] = b"SEF1";
-
-/// Current file format version.
-const FORMAT_VERSION: u16 = 1;
-
-/// Serializes a `Droplet` to a binary writer.
-///
-/// This format is designed for sequential persistence or network transmission.
-/// Note: `degree` is capped at `u16::MAX`.
-///
-/// Layout (Little-Endian):
-///
-/// | Offset | Size | Field          | Description                  |
-/// |--------|------|----------------|------------------------------|
-/// | 0      | 4    | magic          | "SEF1"                       |
-/// | 4      | 2    | version        | Constant: 1                  |
-/// | 6      | 8    | epoch_id       | Unique epoch identifier      |
-/// | 14     | 8    | droplet_id     | Unique droplet identifier    |
-/// | 22     | 2    | degree (D)     | Number of indices            |
-/// | 24     | 4    | padded_len (L) | Payload size in bytes        |
-/// | 28     | D*4  | indices        | Array of source block IDs    |
-/// | 28+D*4 | L    | payload        | XOR'd data symbols           |
-pub fn write_droplet<W: Write>(w: &mut W, droplet: &Droplet) -> io::Result<()> {
-    w.write_all(MAGIC)?;
-    w.write_all(&FORMAT_VERSION.to_le_bytes())?;
-    w.write_all(&droplet.epoch_id.to_le_bytes())?;
-    w.write_all(&droplet.droplet_id.to_le_bytes())?;
-
-    let degree = droplet.indices.len() as u16;
-    w.write_all(&degree.to_le_bytes())?;
-    w.write_all(&droplet.padded_len.to_le_bytes())?;
-
-    for &idx in &droplet.indices {
-        w.write_all(&idx.to_le_bytes())?;
+impl Encodable for Droplet {
+    fn consensus_encode<W: bitcoin::io::Write + ?Sized>(
+        &self,
+        writer: &mut W,
+    ) -> Result<usize, bitcoin::io::Error> {
+        let mut len = 0;
+        len += self.epoch_id.consensus_encode(writer)?;
+        len += self.droplet_id.consensus_encode(writer)?;
+        len += VarInt(self.indices.len() as u64).consensus_encode(writer)?;
+        for &idx in &self.indices {
+            len += idx.consensus_encode(writer)?;
+        }
+        len += self.padded_len.consensus_encode(writer)?;
+        len += VarInt(self.payload.len() as u64).consensus_encode(writer)?;
+        writer.write_all(&self.payload)?;
+        len += self.payload.len();
+        Ok(len)
     }
-
-    w.write_all(&droplet.payload)?;
-    Ok(())
 }
 
-/// Reads and reconstructs a `Droplet` from a binary stream.
-///
-/// # Errors
-/// Returns `InvalidData` if the magic bytes or version are incorrect.
-/// Returns `UnexpectedEof` if the stream ends before the droplet is fully read.
-///
-/// # Security Note
-/// This function allocates memory based on `degree` and `padded_len` read
-/// from the stream. To prevent OOM (Out of Memory) attacks from malicious
-/// data, consider wrapping this in a length-limited reader.
-pub fn read_droplet<R: Read>(r: &mut R) -> io::Result<Droplet> {
-    // Magic
-    let mut magic = [0u8; 4];
-    r.read_exact(&mut magic)?;
-    if &magic != MAGIC {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("invalid magic: {:?}", magic),
-        ));
+impl Decodable for Droplet {
+    fn consensus_decode_from_finite_reader<R: bitcoin::io::Read + ?Sized>(
+        reader: &mut R,
+    ) -> Result<Self, bitcoin::consensus::encode::Error> {
+        let epoch_id = u64::consensus_decode_from_finite_reader(reader)?;
+        let droplet_id = u64::consensus_decode_from_finite_reader(reader)?;
+        let num_indices = VarInt::consensus_decode_from_finite_reader(reader)?.0 as usize;
+        let mut indices = Vec::with_capacity(num_indices.min(encode::MAX_VEC_SIZE / 4));
+        for _ in 0..num_indices {
+            indices.push(u32::consensus_decode_from_finite_reader(reader)?);
+        }
+        let padded_len = u32::consensus_decode_from_finite_reader(reader)?;
+        let payload = Vec::<u8>::consensus_decode_from_finite_reader(reader)?;
+        Ok(Droplet {
+            epoch_id,
+            droplet_id,
+            indices,
+            padded_len,
+            payload,
+        })
     }
-
-    // Version
-    let mut buf2 = [0u8; 2];
-    r.read_exact(&mut buf2)?;
-    let version = u16::from_le_bytes(buf2);
-    if version != FORMAT_VERSION {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("unsupported format version: {}", version),
-        ));
-    }
-
-    // Epoch ID
-    let mut buf8 = [0u8; 8];
-    r.read_exact(&mut buf8)?;
-    let epoch_id = u64::from_le_bytes(buf8);
-
-    // Droplet ID
-    r.read_exact(&mut buf8)?;
-    let droplet_id = u64::from_le_bytes(buf8);
-
-    // Degree
-    r.read_exact(&mut buf2)?;
-    let degree = u16::from_le_bytes(buf2) as usize;
-
-    // Padded length
-    let mut buf4 = [0u8; 4];
-    r.read_exact(&mut buf4)?;
-    let padded_len = u32::from_le_bytes(buf4);
-
-    // Indices
-    let mut indices = Vec::with_capacity(degree);
-    for _ in 0..degree {
-        r.read_exact(&mut buf4)?;
-        indices.push(u32::from_le_bytes(buf4));
-    }
-
-    // Payload
-    let mut payload = vec![0u8; padded_len as usize];
-    r.read_exact(&mut payload)?;
-
-    Ok(Droplet {
-        epoch_id,
-        droplet_id,
-        indices,
-        padded_len,
-        payload,
-    })
 }
 
 /// Write a droplet to a file at the given path.
 pub fn write_droplet_file(path: &std::path::Path, droplet: &Droplet) -> io::Result<()> {
-    let mut file = std::fs::File::create(path)?;
-    write_droplet(&mut file, droplet)
+    let bytes = encode::serialize(droplet);
+    std::fs::write(path, bytes)
 }
 
 /// Read a droplet from a file at the given path.
 pub fn read_droplet_file(path: &std::path::Path) -> io::Result<Droplet> {
-    let mut file = std::fs::File::open(path)?;
-    read_droplet(&mut file)
+    let bytes = std::fs::read(path)?;
+    encode::deserialize(&bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
 /// Generate the canonical filename for a droplet.
@@ -133,7 +70,6 @@ pub fn droplet_filename(epoch_id: u64, droplet_id: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
 
     fn sample_droplet() -> Droplet {
         Droplet {
@@ -148,11 +84,8 @@ mod tests {
     #[test]
     fn test_roundtrip() {
         let original = sample_droplet();
-        let mut buf = Vec::new();
-        write_droplet(&mut buf, &original).unwrap();
-
-        let mut cursor = Cursor::new(&buf);
-        let recovered = read_droplet(&mut cursor).unwrap();
+        let bytes = encode::serialize(&original);
+        let recovered: Droplet = encode::deserialize(&bytes).unwrap();
 
         assert_eq!(recovered.epoch_id, original.epoch_id);
         assert_eq!(recovered.droplet_id, original.droplet_id);
@@ -170,58 +103,20 @@ mod tests {
             padded_len: 4,
             payload: vec![1, 2, 3, 4],
         };
-        let mut buf = Vec::new();
-        write_droplet(&mut buf, &d).unwrap();
-
-        let mut cursor = Cursor::new(&buf);
-        let recovered = read_droplet(&mut cursor).unwrap();
+        let bytes = encode::serialize(&d);
+        let recovered: Droplet = encode::deserialize(&bytes).unwrap();
         assert_eq!(recovered.indices, vec![0]);
         assert_eq!(recovered.payload, vec![1, 2, 3, 4]);
     }
 
     #[test]
-    fn test_bad_magic() {
-        let mut buf = vec![0xFF, 0xFF, 0xFF, 0xFF];
-        buf.extend_from_slice(&1u16.to_le_bytes());
-        let mut cursor = Cursor::new(&buf);
-        let result = read_droplet(&mut cursor);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("magic"));
-    }
-
-    #[test]
-    fn test_bad_version() {
-        let mut buf = Vec::new();
-        buf.extend_from_slice(b"SEF1");
-        buf.extend_from_slice(&99u16.to_le_bytes());
-        let mut cursor = Cursor::new(&buf);
-        let result = read_droplet(&mut cursor);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("version"));
-    }
-
-    #[test]
     fn test_truncated_payload() {
         let d = sample_droplet();
-        let mut buf = Vec::new();
-        write_droplet(&mut buf, &d).unwrap();
+        let mut bytes = encode::serialize(&d);
         // Truncate: remove last 2 bytes of payload
-        buf.truncate(buf.len() - 2);
-        let mut cursor = Cursor::new(&buf);
-        let result = read_droplet(&mut cursor);
+        bytes.truncate(bytes.len() - 2);
+        let result = encode::deserialize::<Droplet>(&bytes);
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_serialized_size() {
-        let d = sample_droplet();
-        let mut buf = Vec::new();
-        write_droplet(&mut buf, &d).unwrap();
-
-        // Expected: 4 (magic) + 2 (version) + 8 (epoch) + 8 (droplet_id)
-        //         + 2 (degree) + 4 (padded_len) + 3*4 (indices) + 8 (payload)
-        let expected = 4 + 2 + 8 + 8 + 2 + 4 + 12 + 8;
-        assert_eq!(buf.len(), expected);
     }
 
     #[test]
@@ -251,7 +146,6 @@ mod tests {
 
     #[test]
     fn test_large_droplet_roundtrip() {
-        // Simulates a realistically sized droplet (~1MB payload)
         let payload_size = 1_000_000;
         let d = Droplet {
             epoch_id: 100,
@@ -261,12 +155,30 @@ mod tests {
             payload: vec![0xAB; payload_size as usize],
         };
 
-        let mut buf = Vec::new();
-        write_droplet(&mut buf, &d).unwrap();
-
-        let mut cursor = Cursor::new(&buf);
-        let recovered = read_droplet(&mut cursor).unwrap();
+        let bytes = encode::serialize(&d);
+        let recovered: Droplet = encode::deserialize(&bytes).unwrap();
         assert_eq!(recovered.payload.len(), payload_size as usize);
         assert_eq!(recovered.indices, vec![0, 50, 100, 200, 499]);
+    }
+
+    #[test]
+    fn test_empty_payload_roundtrip() {
+        let d = Droplet {
+            epoch_id: 1,
+            droplet_id: 2,
+            indices: vec![0],
+            padded_len: 0,
+            payload: vec![],
+        };
+        let bytes = encode::serialize(&d);
+        let recovered: Droplet = encode::deserialize(&bytes).unwrap();
+        assert_eq!(recovered.payload, Vec::<u8>::new());
+        assert_eq!(recovered.padded_len, 0);
+    }
+
+    #[test]
+    fn test_corrupted_data() {
+        let result = encode::deserialize::<Droplet>(&[0xFF, 0xFF]);
+        assert!(result.is_err());
     }
 }
