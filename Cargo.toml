@@ -10,4 +10,9 @@ edition = "2024"
 rand = "0.8"
 rand_chacha = "0.3"
 sha2 = "0.10"
-bitcoin = {version = "0.32", features = ["std"]}
+bitcoinkernel = { version = "0.1", optional = true }
+bitcoin = { version = "0.32", features = ["std"] }
+
+[features]
+default = ["kernel"]
+kernel = ["dep:bitcoinkernel"]
