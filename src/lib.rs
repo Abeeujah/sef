@@ -3,6 +3,7 @@ pub mod decoder;
 pub mod distribution;
 pub mod droplet;
 pub mod encode;
+pub mod epoch;
 pub mod experiment;
 pub mod symbol;
 pub mod xor;
