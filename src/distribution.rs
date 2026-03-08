@@ -8,13 +8,13 @@ pub trait DegreeDistribution {
     /// Samples a degree $d$ such that $1 \le d \le k$ for a given block size `k`.
     ///
     /// This represents the number of source symbols to be XORed together.
-    fn sample_degree<R: Rng + ?Sized>(&self, rng: &mut R, k: usize) -> usize;
+    fn sample_degree<R: Rng + ?Sized>(&self, rng: &mut R) -> usize;
 
     /// Computes the expected value $E[D]$ of the distribution for a block size `k`.
     ///
     /// This is typically used to estimate the average number of XOR operations
     /// per packet or to calculate theoretical overhead.
-    fn expected_degree(&self, k: usize) -> f64;
+    fn expected_degree(&self) -> f64;
 }
 
 /// Robust Soliton Distribution (RSD) for LT (Luby Transform) codes.
@@ -56,7 +56,10 @@ impl RobustSoliton {
     ///
     /// This is an $O(k)$ operation. Use this when the source block size
     /// changes while keeping the same tuning parameters.
+    /// # Panics
+    /// Panics if `k == 0`.
     pub fn rebuild(&mut self, k: usize) {
+        assert!(k > 0, "epoch size k must be > 0");
         if self.k == k {
             return;
         }
@@ -75,7 +78,7 @@ impl RobustSoliton {
         let r_boundary = (k_f / s).round() as usize; // Location of the spike
 
         let mut cdf = vec![0.0f64; k + 1];
-        let mut sum_rho_plus_theta = 0.0;
+        let mut sum_rho_plus_tau = 0.0;
 
         // Calculate unnormalized values and total sum (beta)
         let mut pmf = vec![0.0f64; k + 1];
@@ -85,7 +88,7 @@ impl RobustSoliton {
             } else {
                 1.0 / (d as f64 * (d as f64 - 1.0))
             };
-            let theta = if r_boundary == 0 {
+            let tau = if r_boundary == 0 {
                 0.0
             } else if d < r_boundary {
                 s / (d as f64 * k_f)
@@ -95,14 +98,14 @@ impl RobustSoliton {
                 0.0
             };
 
-            *pf = rho + theta;
-            sum_rho_plus_theta += *pf;
+            *pf = rho + tau;
+            sum_rho_plus_tau += *pf;
         }
 
         // Normalize and build CDF
         let mut running_sum = 0.0;
         for d in 1..=k {
-            running_sum += pmf[d] / sum_rho_plus_theta;
+            running_sum += pmf[d] / sum_rho_plus_tau;
             cdf[d] = running_sum;
         }
 
@@ -112,12 +115,7 @@ impl RobustSoliton {
 }
 
 impl DegreeDistribution for RobustSoliton {
-    fn sample_degree<R: Rng + ?Sized>(&self, rng: &mut R, k: usize) -> usize {
-        assert_eq!(
-            k, self.k,
-            "k mismatch: distribution built for {}, got {}",
-            self.k, k
-        );
+    fn sample_degree<R: Rng + ?Sized>(&self, rng: &mut R) -> usize {
         let u: f64 = rng.r#gen();
 
         // binary_search_by returns the index of an exact match (Ok)
@@ -127,13 +125,11 @@ impl DegreeDistribution for RobustSoliton {
             .unwrap_or_else(|e| e);
 
         // Adjust back for 1-based indexing and clamp to [1, k]
-        (idx + 1).clamp(1, k)
+        (idx + 1).clamp(1, self.k)
     }
 
-    fn expected_degree(&self, k: usize) -> f64 {
-        assert_eq!(k, self.k, "k mismatch");
-
-        self.cdf[..=k]
+    fn expected_degree(&self) -> f64 {
+        self.cdf[..=self.k]
             .windows(2)
             .enumerate()
             .map(|(i, window)| {
@@ -157,11 +153,11 @@ mod tests {
         let dist = RobustSoliton::new(k, 0.1, 0.05);
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
-        let expected = dist.expected_degree(k);
+        let expected = dist.expected_degree();
         let iterations = 100_000;
 
         let actual_avg: f64 = (0..iterations)
-            .map(|_| dist.sample_degree(&mut rng, k) as f64)
+            .map(|_| dist.sample_degree(&mut rng) as f64)
             .sum::<f64>()
             / iterations as f64;
         let diff = (actual_avg - expected).abs();
@@ -208,7 +204,7 @@ mod tests {
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
         for _ in 0..10_000 {
-            let d = dist.sample_degree(&mut rng, k);
+            let d = dist.sample_degree(&mut rng);
             assert!((1..=100).contains(&d), "degree {} out of range", d);
         }
     }
@@ -219,7 +215,7 @@ mod tests {
         let delta = 0.05;
         let dist = RobustSoliton::new(k, 0.1, delta);
 
-        let e = dist.expected_degree(k);
+        let e = dist.expected_degree();
         let (expected_degree, _) = (1..=k).fold((0.0, 0.0), |(sum, prev), d| {
             let current_cdf = dist.cdf[d];
             let prob = current_cdf - prev;

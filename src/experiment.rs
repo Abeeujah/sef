@@ -28,7 +28,7 @@ pub fn generate_droplet_indices<D: DegreeDistribution>(
         .finalize();
     let mut rng = ChaCha8Rng::from_seed(hash.into());
 
-    let degree = dist.sample_degree(&mut rng, k);
+    let degree = dist.sample_degree(&mut rng);
     let mut indices: Vec<u32> = sample(&mut rng, k, degree)
         .into_iter()
         .map(|i| i as u32)

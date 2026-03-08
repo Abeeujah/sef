@@ -131,7 +131,7 @@ impl<'e, D: DegreeDistribution> Encoder<'e, D> {
         let mut rng = self.params.droplet_rng(droplet_id);
 
         // Sample degree from the distribution
-        let degree = self.dist.sample_degree(&mut rng, k);
+        let degree = self.dist.sample_degree(&mut rng);
 
         // Sample `degree` unique indices in [0, k) using Floyd's algorithm via rand
         let mut indices: Vec<u32> = sample(&mut rng, k, degree)
@@ -247,11 +247,11 @@ mod tests {
         // Use a distribution that always returns degree 1
         struct AlwaysOne;
         impl DegreeDistribution for AlwaysOne {
-            fn sample_degree<R: rand::Rng + ?Sized>(&self, _rng: &mut R, _k: usize) -> usize {
+            fn sample_degree<R: rand::Rng + ?Sized>(&self, _rng: &mut R) -> usize {
                 1
             }
 
-            fn expected_degree(&self, _k: usize) -> f64 {
+            fn expected_degree(&self) -> f64 {
                 1.0
             }
         }
@@ -278,11 +278,11 @@ mod tests {
         // Distribution that always returns degree 2
         struct AlwaysTwo;
         impl DegreeDistribution for AlwaysTwo {
-            fn sample_degree<R: rand::Rng + ?Sized>(&self, _rng: &mut R, _k: usize) -> usize {
+            fn sample_degree<R: rand::Rng + ?Sized>(&self, _rng: &mut R) -> usize {
                 2
             }
 
-            fn expected_degree(&self, _k: usize) -> f64 {
+            fn expected_degree(&self) -> f64 {
                 2.0
             }
         }
