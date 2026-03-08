@@ -25,12 +25,14 @@ pub fn run(
         let entry = entry?;
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
-        if entry.file_type()?.is_dir()
-            && let Some(idx_str) = name_str.strip_prefix("epoch_")
-            && let Ok(idx) = idx_str.parse::<usize>()
-            && (epoch_filter.is_none() || epoch_filter == Some(idx))
-        {
-            epoch_dirs.push((idx, entry.path()));
+        if entry.file_type()?.is_dir() {
+            if let Some(idx_str) = name_str.strip_prefix("epoch_") {
+                if let Ok(idx) = idx_str.parse::<usize>() {
+                    if epoch_filter.is_none() || epoch_filter == Some(idx) {
+                        epoch_dirs.push((idx, entry.path()));
+                    }
+                }
+            }
         }
     }
     epoch_dirs.sort_by_key(|(idx, _)| *idx);
@@ -81,24 +83,30 @@ pub fn run(
             continue;
         }
 
-        // Load all droplet files from this epoch directory
-        let mut droplets = Vec::new();
-        for entry in std::fs::read_dir(epoch_dir)? {
-            let entry = entry?;
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            if name_str.ends_with(".bin") && name_str.contains("droplet") {
-                match encode::read_droplet_file(&entry.path()) {
-                    Ok(d) => droplets.push(d),
-                    Err(e) => {
-                        eprintln!(
-                            "  WARNING: epoch {} failed to read {}: {}",
-                            epoch_idx, name_str, e
-                        );
+        // Load droplets: prefer batched droplets.bin, fall back to per-file format
+        let batched_path = epoch_dir.join("droplets.bin");
+        let droplets = if batched_path.exists() {
+            encode::read_epoch_droplets(&batched_path)?
+        } else {
+            let mut per_file = Vec::new();
+            for entry in std::fs::read_dir(epoch_dir)? {
+                let entry = entry?;
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if name_str.ends_with(".bin") && name_str.contains("droplet") {
+                    match encode::read_droplet_file(&entry.path()) {
+                        Ok(d) => per_file.push(d),
+                        Err(e) => {
+                            eprintln!(
+                                "  WARNING: epoch {} failed to read {}: {}",
+                                epoch_idx, name_str, e
+                            );
+                        }
                     }
                 }
             }
-        }
+            per_file
+        };
 
         let num_droplets = droplets.len();
         total_droplets_loaded += num_droplets;

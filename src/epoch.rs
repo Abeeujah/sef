@@ -12,7 +12,7 @@
 //!
 //! let seed = compute_epoch_seed(0, "000000000019d6689c085ae165831e93");
 //! let n = auto_scale_droplets(100, 0); // auto: theory-backed formula
-//! assert_eq!(n, 253);
+//! assert_eq!(n, 291);
 //! ```
 
 use sha2::{Digest, Sha256};
@@ -80,7 +80,7 @@ pub fn auto_scale_droplets(unit_k: usize, n: u64) -> u64 {
         let k = unit_k as f64;
         // LT overhead: N = k + safety * sqrt(K) * ln(K / delta)
         let delta = 0.05_f64;
-        let safety = 2.0_f64;
+        let safety = 2.5_f64;
         let overhead = safety * k.sqrt() * (k / delta).ln();
         let n = k + overhead;
         (n.ceil() as u64).max(unit_k as u64 + 1)
