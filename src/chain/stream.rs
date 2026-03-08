@@ -1,32 +1,55 @@
+//! Core streaming abstractions for block ingestion and epoch grouping.
+//!
+//! The [`BlockSource`] trait decouples the fountain encoder from the specific
+//! Bitcoin data-directory format, enabling both raw `blk*.dat` and
+//! kernel-based backends to supply blocks through a uniform streaming
+//! interface.
+//!
+//! [`for_each_epoch`] implements a sliding-window epoch grouper with a
+//! configurable buffer exclusion for recent blocks, keeping peak memory at
+//! *O*(*k* + *buffer*). For batch use where all blocks are already in memory,
+//! see [`group_into_epochs`].
+
 use std::{collections::VecDeque, ops::ControlFlow};
 
 use crate::chain::error::ChainError;
 
-/// A source symbol for the fountain encoder, representing a
-/// raw block read from disk: height, hash and consensus-serialized
-/// bytes.
+/// Minimal representation of a Bitcoin block needed by the fountain encoder.
+///
+/// Carries the block's position in the active chain, its hash, and the full
+/// consensus-serialized byte payload in [`data`](Self::data). Instances are
+/// produced by [`BlockSource`] implementations and consumed by the epoch
+/// grouping functions.
 #[derive(Debug, Clone)]
 pub struct RawBlock {
-    /// The block height. (position in the active chain, starting from 0).
+    /// Position in the active chain (genesis = 0).
     pub height: u32,
 
-    /// Block hash as hex string.
+    /// Block hash as a hex-encoded string.
     pub hash: String,
 
-    /// Raw consensus-serialized block bytes.
+    /// Full consensus-serialized block bytes.
     pub data: Vec<u8>,
 }
 
-/// A batch of blocks forming one epoch, emitted by `for_each_epoch`.
+/// A complete batch of blocks ready for fountain encoding.
+///
+/// Emitted by [`for_each_epoch`] and consumed by the encoder. Each batch
+/// contains exactly *K* blocks, except for the last epoch which may be
+/// smaller (a "tail epoch").
 pub struct EpochBatch {
     /// Zero-based epoch index.
     pub index: usize,
 
-    /// The blocks in this epoch (at most `k` blocks).
+    /// The blocks in this epoch (at most *K* blocks).
     pub blocks: Vec<RawBlock>,
 }
 
-/// Chain statistics collected during a streaming scan.
+/// Summary statistics collected via a single streaming pass over a
+/// [`BlockSource`].
+///
+/// Captures aggregate metrics (block count, byte totals, size extremes)
+/// and the tip of the active chain without retaining any block data.
 pub struct ChainStats {
     pub block_count: u32,
     pub total_bytes: u64,
@@ -36,21 +59,33 @@ pub struct ChainStats {
     pub tip_hash: String,
 }
 
-/// Trait for streaming block access.
+/// Streaming block access from a Bitcoin data source.
 ///
-/// Implementations yield blocks one at a time via a callback, enabling
-/// O(epoch_size) memory usage instead of loading the entire chain.
+/// Implementations yield blocks one at a time via a visitor callback,
+/// enabling *O*(*epoch_size*) memory usage instead of loading the entire
+/// chain. The two provided implementations are
+/// [`BlkFileReader`](super::blk_file_reader::BlkFileReader) and
+/// [`KernelBlockReader`](super::kernel_reader::KernelBlockReader).
 pub trait BlockSource {
-    /// Visit each block on the active chain in height order.
+    /// Iterates the active chain in height order, invoking `visitor` once
+    /// per block.
     ///
-    /// The visitor receives one `RawBlock` at a time. Return
-    /// `ControlFlow::Break(())` to stop early.
+    /// The visitor may return [`ControlFlow::Break()`] to terminate the
+    /// scan early.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChainError`] if a block cannot be read or deserialized.
     fn for_each_block(
         &self,
         visitor: &mut dyn FnMut(RawBlock) -> Result<ControlFlow<()>, ChainError>,
     ) -> Result<(), ChainError>;
 
-    /// Convenience: load all blocks into memory (test/compat path).
+    /// Loads every block on the active chain into memory and returns them.
+    ///
+    /// This is a convenience wrapper around [`for_each_block`](Self::for_each_block).
+    /// It allocates *O*(*chain_size*) memory and should only be used for
+    /// testing or small chains.
     fn read_all_blocks(&self) -> Result<Vec<RawBlock>, ChainError> {
         let mut out = Vec::new();
         self.for_each_block(&mut |b| {
@@ -60,7 +95,8 @@ pub trait BlockSource {
         Ok(out)
     }
 
-    /// Collect chain statistics without retaining block data.
+    /// Collects [`ChainStats`] via a single streaming pass, without
+    /// retaining any block data in memory.
     fn chain_stats(&self) -> Result<ChainStats, ChainError> {
         let mut count = 0;
         let mut total_bytes = 0;
@@ -99,10 +135,14 @@ pub trait BlockSource {
     }
 }
 
-/// Stream blocks through an epoch-grouping pipeline.
+/// Streams blocks through an epoch-grouping pipeline.
 ///
-/// Calls `visitor` once per complete epoch of `k` blocks. The most recent
-/// `buffer` blocks are excluded. Peak memory is O(k + buffer).
+/// Invokes `visitor` once per epoch of `k` blocks. The most recent `buffer`
+/// blocks are held back and never emitted, simulating a confirmation window
+/// that prevents encoding of not-yet-settled chain tip blocks. The last
+/// emitted epoch may contain fewer than `k` blocks (a "tail epoch").
+///
+/// Peak memory usage is *O*(*k* + *buffer*).
 pub fn for_each_epoch<S: BlockSource + ?Sized>(
     source: &S,
     k: usize,
@@ -150,13 +190,13 @@ pub fn for_each_epoch<S: BlockSource + ?Sized>(
     Ok(())
 }
 
-/// Group blocks into epochs of size `k`.
+/// Groups a pre-loaded slice of blocks into epochs of size `k`.
 ///
-/// The last epoch may be smaller than `k` (a "tail epoch").
+/// The last epoch may contain fewer than `k` blocks (a "tail epoch").
 /// The most recent `buffer` blocks are excluded from encoding.
 ///
-/// NOTE: this function requires all blocks in memory. Prefer
-/// `for_each_epoch()` for streaming epoch processing.
+/// This function requires all blocks in memory. For production use, prefer
+/// [`for_each_epoch`] which streams blocks with *O*(*k* + *buffer*) memory.
 pub fn group_into_epochs(blocks: &[RawBlock], k: usize, buffer: usize) -> Vec<&[RawBlock]> {
     if blocks.len() <= buffer {
         return vec![];

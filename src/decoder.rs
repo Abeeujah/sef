@@ -1,3 +1,21 @@
+//! LT peeling decoder and block verification infrastructure.
+//!
+//! The peeling decoder operates on the bipartite graph between droplets and
+//! source blocks, iteratively resolving singletons (degree-1 droplets) to
+//! recover source data.  Two entry points are provided:
+//!
+//! - [`peeling_check`] — lightweight graph-only simulation (no payloads).
+//! - [`peeling_decode`] — full payload-recovery decoder with integrated
+//!   [`BlockVerifier`] verification.
+//!
+//! Verification is pluggable via the [`BlockVerifier`] trait, with concrete
+//! implementations for Bitcoin blocks ([`BitcoinBlockVerifier`]) and
+//! symbol-mode decoding ([`SymbolVerifier`]).
+//!
+//! # Dependency graph
+//!
+//! - **Depends on:** [`crate::droplet`], [`crate::xor`]
+
 use std::{
     collections::{HashMap, VecDeque},
     fmt,
@@ -15,12 +33,14 @@ use crate::{droplet::Droplet, xor};
 #[derive(Debug, Clone)]
 pub struct PeelResult {
     /// Number of source blocks successfully recovered.
+    /// Monotonically increases during the peeling process.
     pub decoded: usize,
 
     /// Total number of source blocks ($K$) in the epoch.
     pub total: usize,
 
-    /// Number of "peeling" steps performed (one iteration per processed singleton).
+    /// Number of peeling steps performed (one per processed singleton).
+    /// Equals `decoded` in the absence of duplicate singletons.
     pub iterations: usize,
 
     /// Whether all `total` blocks were recovered (decoded == total).
@@ -33,6 +53,23 @@ pub struct PeelResult {
 /// This function verifies if the current set of droplets provides enough
 /// information to recover all $K$ source blocks. It uses a queue-based
 /// approach to track the "Ripple" (available singletons).
+///
+/// # Examples
+///
+/// ```
+/// use sef::decoder::peeling_check;
+///
+/// // Three singletons covering all blocks → success.
+/// let droplets = vec![vec![0], vec![1], vec![2]];
+/// let result = peeling_check(3, &droplets);
+/// assert!(result.success);
+///
+/// // A chain that peels from a single seed singleton.
+/// let droplets = vec![vec![0], vec![0, 1], vec![1, 2]];
+/// let result = peeling_check(3, &droplets);
+/// assert!(result.success);
+/// assert_eq!(result.decoded, 3);
+/// ```
 pub fn peeling_check(k: usize, droplets: &[Vec<u32>]) -> PeelResult {
     let mut degree: Vec<u32> = droplets.iter().map(|d| d.len() as u32).collect();
     let mut last_block: Vec<u32> = droplets.iter().map(|d| *d.last().unwrap_or(&0)).collect();
@@ -94,7 +131,15 @@ pub fn peeling_check(k: usize, droplets: &[Vec<u32>]) -> PeelResult {
     }
 }
 
-/// Errors for validating recovered source blocks.
+/// Errors produced when a [`BlockVerifier`] rejects a recovered source block.
+///
+/// # Variants
+///
+/// | Variant | Meaning |
+/// |---------|---------|
+/// | [`Deserialize`](Self::Deserialize) | Candidate bytes cannot be parsed as the expected structure. |
+/// | [`HashMismatch`](Self::HashMismatch) | Parsed successfully but the content hash does not match. |
+/// | [`NonZeroPadding`](Self::NonZeroPadding) | Trailing bytes after the parsed structure are not all zero. |
 #[derive(Debug)]
 pub enum VerifyError {
     /// The recovered bytes are not a valid Bitcoin block structure.
@@ -141,22 +186,27 @@ impl fmt::Display for VerifyError {
 pub trait BlockVerifier {
     /// Validates the `candidate` buffer against the expected data for `block_idx`.
     ///
+    /// The returned length represents the original data size *before*
+    /// zero-padding was applied.  The caller uses this value to strip
+    /// trailing padding from `candidate`, so implementations **must**
+    /// return the exact pre-padding byte count on success.
+    ///
     /// # Returns
-    /// - `Ok(length)`: The integrity check passed; returns the size of the
-    ///   actual data (excluding any trailing zero-padding).
+    /// - `Ok(length)`: The integrity check passed; `length` is the byte count
+    ///   of the actual data (excluding any trailing zero-padding).
     /// - `Err(VerifyError)`: The data is corrupted or does not match the
     ///   expected block for this index.
     fn verify_and_len(&self, block_idx: u32, candidate: &[u8]) -> Result<usize, VerifyError>;
 }
 
-/// A Bitcoin-specific implementation of `BlockVerifier`.
+/// Bitcoin-specific [`BlockVerifier`] implementation.
 ///
-/// This verifier uses a pre-calculated list of block hashes (e.g., from
-/// a trusted header chain) to validate the results of the XOR-peeling
-/// process for each source block in the epoch.
+/// Uses a pre-calculated list of block hashes (e.g., from a trusted header
+/// chain) to validate XOR-peeling results.  `expected_hashes` **must** be
+/// ordered by source block index within the epoch, i.e.,
+/// `expected_hashes[i]` corresponds to source block $i$.
 pub struct BitcoinBlockVerifier {
-    /// Expected `BlockHash`es where `expected_hashes[i]` is the
-    /// target hash for the source block at index `i`.
+    /// Expected `BlockHash`es, ordered by source block index within the epoch.
     pub expected_hashes: Vec<bitcoin::BlockHash>,
 }
 
@@ -184,9 +234,15 @@ impl BlockVerifier for BitcoinBlockVerifier {
     }
 }
 
-/// Verifier for symbol-mode decoding: checks SHA256 hash of each symbol against the manifest.
+/// [`BlockVerifier`] for symbol-mode decoding.
+///
+/// Verifies fixed-size symbols against a pre-computed SHA-256 hash manifest
+/// (see [`SymbolManifest`](crate::symbol::SymbolManifest)).  Each candidate
+/// is hashed and compared to `symbol_hashes[block_idx]`.
 pub struct SymbolVerifier<'a> {
+    /// Expected byte length of every symbol.
     pub symbol_size: usize,
+    /// SHA-256 digests indexed by source block position.
     pub symbol_hashes: &'a [[u8; 32]],
 }
 
@@ -238,10 +294,9 @@ pub struct BlockFailure {
     /// The source block index $[0, K) that was not recovered.
     pub index: u32,
 
-    /// The "residual degree" of this block.
-    ///
-    /// Represents how many un-peeled droplets still depend on this block.
-    /// If this is 0, the block was never included in any droplet.
+    /// Residual degree: number of un-peeled droplets still referencing this
+    /// block.  A value of 0 means the block was never covered by any droplet
+    /// in the input set.
     pub referenced_by: usize,
 }
 
@@ -265,8 +320,9 @@ pub struct DecodeResult {
     /// Total peeling steps performed.
     pub iterations: usize,
 
-    /// Number of droplets that were rejected by the `BlockVerifier`.
-    /// A non-zero value suggests network corruption or an adverserial sender.
+    /// Number of droplets rejected by the [`BlockVerifier`].
+    /// A non-zero value suggests network corruption or an adversarial sender;
+    /// useful as a signal for Byzantine-fault detection.
     pub verify_failures: usize,
 
     /// The condition that caused the decoder to terminate.
@@ -287,9 +343,11 @@ impl DecodeResult {
 /// Executes the Luby Transform (LT) peeling algorithm with integrated
 /// payload recovery and data verification.
 ///
-/// This function iteratively identifies "singleton" droplets, verifies their
-/// content via the provided `BlockVerifier` and peels them out of all
-/// connected droplets in the encoding graph.
+/// Iteratively identifies singleton droplets, verifies their content via the
+/// provided [`BlockVerifier`], and peels them out of all connected droplets
+/// in the encoding graph.  Droplets that fail
+/// [`Droplet::validate`](crate::droplet::Droplet::validate) are silently
+/// disabled before the main loop begins.
 ///
 /// # Logic
 /// 1. Initialize the "Ripple" (queue) with all degree-1 droplets.
@@ -297,6 +355,39 @@ impl DecodeResult {
 /// 3. If verified, XOR this block out of all other droplets that include it.
 /// 4. Add any newly created singletons to the queue.
 /// 5. Repeat until the ripple is empty or all $K$ blocks are recovered.
+///
+/// # Panics
+///
+/// This function does not panic.
+///
+/// # Examples
+///
+/// ```
+/// use sef::decoder::{peeling_decode, BlockVerifier, VerifyError, DecodeStopReason};
+/// use sef::droplet::Droplet;
+///
+/// // Trivial verifier that accepts everything at full length.
+/// struct AcceptAll;
+/// impl BlockVerifier for AcceptAll {
+///     fn verify_and_len(&self, _idx: u32, c: &[u8]) -> Result<usize, VerifyError> {
+///         Ok(c.len())
+///     }
+/// }
+///
+/// let blocks: Vec<Vec<u8>> = vec![vec![0xAA; 8], vec![0xBB; 8], vec![0xCC; 8]];
+/// let droplets = vec![
+///     Droplet { epoch_id: 0, droplet_id: 0, indices: vec![0],
+///               padded_len: 8, payload: blocks[0].clone() },
+///     Droplet { epoch_id: 0, droplet_id: 1, indices: vec![1],
+///               padded_len: 8, payload: blocks[1].clone() },
+///     Droplet { epoch_id: 0, droplet_id: 2, indices: vec![2],
+///               padded_len: 8, payload: blocks[2].clone() },
+/// ];
+///
+/// let result = peeling_decode(3, droplets, &AcceptAll);
+/// assert!(result.is_success());
+/// assert_eq!(result.stop_reason, DecodeStopReason::Completed);
+/// ```
 pub fn peeling_decode(
     k: usize,
     droplets: Vec<Droplet>,

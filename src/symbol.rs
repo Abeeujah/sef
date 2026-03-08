@@ -1,48 +1,105 @@
+//! Normalizes variable-length blockchain data into uniform fixed-size symbols for fountain encoding.
+//!
+//! Without normalization, the RSD-based encoder must pad every XOR operation to
+//! the length of the largest block in the epoch, wasting bandwidth proportional
+//! to the variance in block sizes. This module concatenates all blocks into a
+//! single contiguous byte stream, then slices that stream into fixed-size chunks
+//! of [`DEFAULT_SYMBOL_SIZE`] bytes. Only the final symbol may contain
+//! zero-padding.
+//!
+//! Concatenation reduces the effective $K$ for the fountain code—many small
+//! blocks pack into fewer symbols—improving both RSD efficiency and decoding
+//! probability. The [`SymbolManifest`] tracks the mapping from symbols back to
+//! original blocks, enabling reassembly after decoding.
+//!
+//! **Dependency graph position:** downstream of raw block ingestion
+//! (`crate::chain`), upstream of [`crate::droplet::Encoder`].
+//!
+//! # Examples
+//!
+//! ```
+//! use sef::symbol::{blocks_to_symbols, symbols_to_blocks, DEFAULT_SYMBOL_SIZE};
+//!
+//! let blocks = vec![vec![0xAAu8; 300], vec![0xBBu8; 500]];
+//! let (symbols, manifest) = blocks_to_symbols(&blocks, DEFAULT_SYMBOL_SIZE);
+//!
+//! // Simulate a full decode: all symbols recovered.
+//! let decoded: Vec<Option<Vec<u8>>> = symbols.into_iter().map(Some).collect();
+//! let recovered = symbols_to_blocks(&decoded, &manifest);
+//!
+//! assert_eq!(recovered[0].as_ref().unwrap(), &blocks[0]);
+//! assert_eq!(recovered[1].as_ref().unwrap(), &blocks[1]);
+//! ```
+
 use bitcoin::{
     VarInt,
     consensus::{Decodable, Encodable, encode},
 };
 use sha2::{Digest, Sha256};
 
-/// Default symbol size in bytes.
+/// Default symbol size in bytes (4 KiB).
+///
+/// Aligns with typical filesystem page size and provides a reasonable
+/// trade-off between symbol count (lower $K$ → better RSD efficiency)
+/// and padding overhead on the final symbol.
 pub const DEFAULT_SYMBOL_SIZE: usize = 4096;
 
-/// Tracks how symbols map back to original blocks.
+/// Metadata sidecar that maps decoded symbols back to original blocks.
 ///
-/// Each block is split into `ceil(block_len / symbol_size)` symbols.
-/// The last symbol of each block is zero-padded to `symbol_size`.
+/// After the fountain decoder recovers individual symbols, this manifest
+/// provides the byte-level mapping needed to reassemble the original
+/// variable-length blocks from the concatenated symbol stream. It must be
+/// distributed alongside the encoded droplets (or stored out-of-band) so
+/// that any decoder can reconstruct the original data.
+///
+/// Implements [`Encodable`] / [`Decodable`] for consensus-compatible
+/// serialization, making it suitable for on-chain or P2P transport.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SymbolManifest {
-    /// Symbol size in bytes (all symbols are exactly this size).
+    /// Symbol size in bytes. Every symbol—including the final one—is
+    /// exactly this length (the tail is zero-padded).
     pub symbol_size: usize,
 
-    /// Total number of symbols across all blocks.
+    /// Total number of symbols produced by [`blocks_to_symbols`].
     pub total_symbols: usize,
 
-    /// For each original block: (byte_offset, true_byte_length).
+    /// Per-block metadata recording each block's position and true length
+    /// within the concatenated byte stream. See [`BlockEntry`].
     pub block_entries: Vec<BlockEntry>,
 
-    /// SHA256 hash of each symbol for integrity verification during peeling decode.
+    /// SHA-256 hash of each symbol, used for integrity verification during
+    /// peeling decode.
     pub symbol_hashes: Vec<[u8; 32]>,
 }
 
-/// Manifest entry for a single original block.
+/// Manifest entry describing a single original block's position in the concatenated stream.
+///
+/// Used by [`symbols_to_blocks`] to extract the correct byte range from the
+/// reassembled symbol stream.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BlockEntry {
-    /// Byte offset of this block in the concatenated stream.
+    /// Byte offset of this block relative to the *concatenated* byte stream
+    /// (not relative to any individual block or symbol boundary).
     pub byte_offset: usize,
 
-    /// True serialized byte length of the block (before padding).
+    /// True serialized byte length of the block before zero-padding.
     pub true_len: usize,
 }
 
-/// Split epoch blocks into fixed-size symbols using block concatenation.
+/// Concatenates `blocks` into a single byte stream, then slices into fixed-size symbols.
 ///
-/// All blocks are concatenated into a single byte stream, then split into
-/// fixed-size symbols. This minimizes padding waste compared to splitting
-/// each block independently. Only the final symbol may contain zero-padding.
+/// Unlike a per-block splitting strategy (where each block is independently
+/// padded to `symbol_size`), concatenation packs data tightly: block
+/// boundaries may fall mid-symbol, and only the final symbol carries
+/// zero-padding. This reduces the total symbol count—and therefore the
+/// effective $K$—yielding better RSD efficiency and decoding probability.
 ///
-/// Returns the symbols and a manifest that maps symbols back to blocks.
+/// Returns `(symbols, manifest)` where every symbol is exactly `symbol_size`
+/// bytes and [`SymbolManifest`] records the mapping back to original blocks.
+///
+/// # Panics
+///
+/// Panics if `symbol_size == 0`.
 pub fn blocks_to_symbols(blocks: &[Vec<u8>], symbol_size: usize) -> (Vec<Vec<u8>>, SymbolManifest) {
     assert!(symbol_size > 0, "symbol_size must be positive");
 
@@ -104,13 +161,14 @@ pub fn blocks_to_symbols(blocks: &[Vec<u8>], symbol_size: usize) -> (Vec<Vec<u8>
     (symbols, manifest)
 }
 
-/// Reconstruct blocks from decoded symbols using the manifest.
+/// Reconstructs original blocks from decoded symbols using the [`SymbolManifest`].
 ///
-/// with block concatenation, `byte_offset` in BlockEntry stores the byte offset
-/// in the concatenated stream. We reconstruct the stream from symbols, then
-/// extract each block by its byte offset and length.
-///
-/// Returns `Some(block_bytes)` for fully reconstructed blocks, `None` otherwise.
+/// For each [`BlockEntry`] in the manifest, the function identifies the
+/// symbol range that covers `[byte_offset, byte_offset + true_len)` in the
+/// concatenated stream. If every symbol in that range is `Some`, the block
+/// bytes are extracted and returned. Otherwise, the entry yields `None`,
+/// enabling partial-recovery semantics: callers can determine exactly which
+/// original blocks were successfully decoded.
 pub fn symbols_to_blocks(
     symbols: &[Option<Vec<u8>>],
     manifest: &SymbolManifest,
@@ -159,6 +217,7 @@ pub fn symbols_to_blocks(
         .collect()
 }
 
+/// Wire format: `VarInt(byte_offset) || VarInt(true_len)`.
 impl Encodable for BlockEntry {
     fn consensus_encode<W: bitcoin::io::Write + ?Sized>(
         &self,
@@ -171,6 +230,7 @@ impl Encodable for BlockEntry {
     }
 }
 
+/// Decodes `VarInt(byte_offset) || VarInt(true_len)`.
 impl Decodable for BlockEntry {
     fn consensus_decode_from_finite_reader<R: bitcoin::io::Read + ?Sized>(
         reader: &mut R,
@@ -184,6 +244,7 @@ impl Decodable for BlockEntry {
     }
 }
 
+/// Wire format: `VarInt(symbol_size) || VarInt(total_symbols) || VarInt(n_entries) || [BlockEntry; n_entries] || VarInt(n_hashes) || [[u8; 32]; n_hashes]`.
 impl Encodable for SymbolManifest {
     fn consensus_encode<W: bitcoin::io::Write + ?Sized>(
         &self,
@@ -205,6 +266,7 @@ impl Encodable for SymbolManifest {
     }
 }
 
+/// Inverse of the [`SymbolManifest`] [`Encodable`] impl.
 impl Decodable for SymbolManifest {
     fn consensus_decode_from_finite_reader<R: bitcoin::io::Read + ?Sized>(
         reader: &mut R,
@@ -232,12 +294,12 @@ impl Decodable for SymbolManifest {
     }
 }
 
-/// Serialize a manifest to bytes.
+/// Serializes a [`SymbolManifest`] to bytes using Bitcoin consensus encoding.
 pub fn serialize_manifest(manifest: &SymbolManifest) -> Vec<u8> {
     encode::serialize(manifest)
 }
 
-/// Deserialize a manifest from bytes.
+/// Deserializes a [`SymbolManifest`] from bytes produced by [`serialize_manifest`].
 pub fn deserialize_manifest(data: &[u8]) -> Result<SymbolManifest, encode::Error> {
     encode::deserialize(data)
 }

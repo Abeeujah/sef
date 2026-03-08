@@ -1,3 +1,17 @@
+//! Binary serialization of [`Droplet`] using Bitcoin consensus encoding.
+//!
+//! Serialized droplets use Bitcoin's `VarInt` length-prefixed format for the
+//! index vector and payload, producing a compact on-disk / on-wire
+//! representation suitable for storage and network transfer.
+//!
+//! Additionally exposes filesystem I/O helpers for persisting individual
+//! droplets to and from `.bin` files.
+//!
+//! # Dependency graph
+//!
+//! - **Depends on:** [`crate::droplet`]
+//! - **Consumed by:** the `generate` and `reconstruct` commands.
+
 use std::io::{self};
 
 use bitcoin::{
@@ -7,6 +21,12 @@ use bitcoin::{
 
 use crate::droplet::Droplet;
 
+/// Consensus-encodes a [`Droplet`] into the following wire format:
+///
+/// ```text
+/// epoch_id (u64) || droplet_id (u64) || num_indices (VarInt) || indices (u32 each)
+/// || padded_len (u32) || payload_len (VarInt) || payload (bytes)
+/// ```
 impl Encodable for Droplet {
     fn consensus_encode<W: bitcoin::io::Write + ?Sized>(
         &self,
@@ -27,6 +47,8 @@ impl Encodable for Droplet {
     }
 }
 
+/// Reconstructs a [`Droplet`] from its consensus-encoded byte stream,
+/// inverting the wire format produced by the [`Encodable`] impl.
 impl Decodable for Droplet {
     fn consensus_decode_from_finite_reader<R: bitcoin::io::Read + ?Sized>(
         reader: &mut R,
@@ -50,19 +72,25 @@ impl Decodable for Droplet {
     }
 }
 
-/// Write a droplet to a file at the given path.
+/// Consensus-serializes the [`Droplet`] and writes the resulting bytes
+/// atomically to `path`.
 pub fn write_droplet_file(path: &std::path::Path, droplet: &Droplet) -> io::Result<()> {
     let bytes = encode::serialize(droplet);
     std::fs::write(path, bytes)
 }
 
-/// Read a droplet from a file at the given path.
+/// Reads raw bytes from `path` and consensus-deserializes them into a
+/// [`Droplet`].
+///
+/// Returns an [`io::Error`] with kind [`io::ErrorKind::InvalidData`] if the
+/// byte stream does not represent a valid [`Droplet`].
 pub fn read_droplet_file(path: &std::path::Path) -> io::Result<Droplet> {
     let bytes = std::fs::read(path)?;
     encode::deserialize(&bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
-/// Generate the canonical filename for a droplet.
+/// Produces the canonical filename for a droplet:
+/// `epoch_{epoch_id}_droplet_{droplet_id}.bin`.
 pub fn droplet_filename(epoch_id: u64, droplet_id: u64) -> String {
     format!("epoch_{}_droplet_{}.bin", epoch_id, droplet_id)
 }

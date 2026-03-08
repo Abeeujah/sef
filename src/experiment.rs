@@ -1,3 +1,19 @@
+//! Simulation infrastructure for evaluating fountain code storage reduction in a distributed network model.
+//!
+//! Models a network of $n = 100$ nodes, each storing a random subset of $s$
+//! droplets drawn from a pre-generated pool. The core question: given $K$
+//! contacted nodes, can the union of their droplets reconstruct all $k$ source
+//! blocks via the peeling decoder?
+//!
+//! Two experiment modes are provided:
+//!
+//! - [`run_experiment`] — multi-node storage reduction simulation. Sweeps over
+//!   `(s, K)` configurations to measure reconstruction success rate.
+//! - [`sweep_total_droplets`] — pure decoding threshold analysis. Ignores the
+//!   node model and directly varies the number of distinct droplets $M$.
+//!
+//! **Depends on:** [`crate::distribution`], [`crate::decoder`].
+
 use std::collections::HashSet;
 
 use rand::{SeedableRng, seq::index::sample};
@@ -9,10 +25,26 @@ use crate::{
     distribution::{DegreeDistribution, RobustSoliton},
 };
 
-/// Generate the neighbor indices for a droplet (without computing XOR payloads).
+/// Generates the neighbor (source block) indices for a droplet without computing XOR payloads.
 ///
-/// Uses Sha256 to derive a deterministic seed from the epoch and droplet metadata,
-/// ensuring the graph structure is reproducible across different runs and platforms.
+/// Uses SHA-256 to derive a deterministic seed from the epoch and droplet
+/// metadata, ensuring the graph structure is reproducible across runs and
+/// platforms. This mirrors the PRNG derivation in
+/// `EpochParams::droplet_rng` but avoids materializing block payloads,
+/// making it suitable for graph-only simulation.
+///
+/// # Examples
+///
+/// ```
+/// use sef::distribution::RobustSoliton;
+/// use sef::experiment::generate_droplet_indices;
+///
+/// let dist = RobustSoliton::new(100, 0.1, 0.05);
+/// let seed = [0u8; 32];
+/// let indices = generate_droplet_indices(&dist, 100, &seed, 0, 42);
+/// assert!(!indices.is_empty());
+/// assert!(indices.iter().all(|&i| (i as usize) < 100));
+/// ```
 pub fn generate_droplet_indices<D: DegreeDistribution>(
     dist: &D,
     k: usize,
@@ -38,27 +70,39 @@ pub fn generate_droplet_indices<D: DegreeDistribution>(
 }
 
 /// Configuration for a storage reduction experiment.
+///
+/// Controls every axis of the simulation grid: the fountain code parameters
+/// ($k$, $c$, $\delta$), the droplet pool from which nodes draw, and the
+/// `(s, K)` sweep ranges.
 #[derive(Debug, Clone)]
 pub struct ExperimentConfig {
-    /// Epoch size (number of source blocks).
+    /// Number of source blocks (symbols) in the epoch. Determines the
+    /// Robust Soliton Distribution parameterization.
     pub k: usize,
 
-    /// Robust Soliton parameter c (determines the 'spike' in the distribution).
+    /// Robust Soliton parameter $c$. Scales the "spike" that biases the
+    /// distribution toward degree-1 droplets, aiding peeling decode startup.
     pub c: f64,
 
-    /// Robust Soliton parameter delta (allowable failure probability).
+    /// Robust Soliton failure-probability bound $\delta$. Smaller values
+    /// produce heavier spike mass at the cost of higher average degree.
     pub delta: f64,
 
-    /// Total droplet pool size (should be >= 3k).
+    /// Size of the pre-generated droplet pool. Should be $\geq 3k$ to
+    /// ensure sufficient diversity when nodes sample from it.
     pub pool_size: usize,
 
-    /// Number of trials per (s, K) configuration.
+    /// Number of independent trials executed per `(s, K)` configuration.
+    /// Higher values reduce variance in the reported success rate.
     pub trials: usize,
 
-    /// Droplets stored per individual node.
+    /// List of "droplets per node" values ($s$) to sweep. Each node stores
+    /// exactly $s$ droplets drawn uniformly without replacement from the pool.
     pub s_values: Vec<usize>,
 
-    /// Number of nodes sampled to attempt reconstruction.
+    /// List of "nodes contacted" values ($K$) to sweep. For each $K$, the
+    /// simulator unions the droplets of $K$ randomly chosen nodes and
+    /// attempts peeling decode.
     pub k_nodes_values: Vec<usize>,
 }
 
@@ -76,48 +120,75 @@ impl Default for ExperimentConfig {
     }
 }
 
-/// Result of one experiment trial.
+/// Outcome of a single simulation trial for one `(s, K)` pair.
 #[derive(Debug, Clone)]
 pub struct TrialResult {
-    /// Droplets per node.
+    /// Number of droplets stored per node ($s$).
     pub s: usize,
 
-    /// Number of nodes contacted.
+    /// Number of nodes contacted ($K$) in this trial.
     pub k_nodes: usize,
 
-    /// Number of distinct droplets obtained (after union).
+    /// Number of distinct droplets in the union of the $K$ contacted nodes.
     pub distinct_droplets: usize,
 
-    /// Peeling decoder result.
+    /// Result of running the peeling decoder on the collected droplets.
     pub peel: PeelResult,
 }
 
-/// Result of a full experiment configuration (aggregated over trials).
+/// Aggregated statistics for one `(s, K)` configuration across all trials.
 #[derive(Debug, Clone)]
 pub struct ConfigResult {
+    /// Droplets stored per node ($s$).
     pub s: usize,
+    /// Number of nodes contacted ($K$).
     pub k_nodes: usize,
+    /// Theoretical storage reduction factor: $k / s$.
     pub reduction_factor: f64,
+    /// Total number of trials executed.
     pub trials: usize,
+    /// Number of trials where all $k$ source blocks were recovered.
     pub successes: usize,
+    /// Fraction of trials that achieved full recovery (`successes / trials`).
     pub success_rate: f64,
+    /// Mean number of distinct droplets across trials.
     pub mean_distinct_droplets: f64,
+    /// Mean number of source blocks decoded per trial.
     pub mean_decoded: f64,
 }
 
-/// Run the full storage reduction experiment.
+/// Runs the full storage reduction experiment across all `(s, K)` configurations.
 ///
-/// This simulation models a distributed network of $n=100$ nodes.
-/// Each node stores a subset of $s$ droplets from a larger pre-generated pool.
+/// Simulates a distributed network of $n = 100$ nodes. Each node stores $s$
+/// droplets sampled uniformly without replacement from a pre-generated pool
+/// of `pool_size` droplet indices.
 ///
-/// The experiment evaluates the "solvability" of the graph: can we reconstruct
-/// the $k$ source blocks by contacting only $K$ nodes?
+/// For every `(s, K)` pair in the configuration, the simulator executes
+/// `trials` independent rounds:
 ///
-/// ### Process:
-/// 1. Generate a fixed pool of `pool_size` droplet indices.
-/// 2. Assign $s$ unique droplets to each of the 100 simulated nodes.
-/// 3. For each $(s, K)$ configuration, run $N$ trials.
-/// 4. In each trial, pick $K$ nodes, union their unique droplets, and run the peeling decoder.
+/// 1. Generate a fixed pool of `pool_size` droplet neighbor-index vectors.
+/// 2. Assign $s$ unique droplets to each of the 100 nodes.
+/// 3. Select $K$ nodes at random, union their droplets.
+/// 4. Run the peeling decoder on the union and record success/failure.
+///
+/// Returns one [`ConfigResult`] per `(s, K)` pair, ordered by ascending $s$
+/// then ascending $K$.
+///
+/// # Examples
+///
+/// ```ignore
+/// use sef::experiment::{ExperimentConfig, run_experiment};
+///
+/// let config = ExperimentConfig {
+///     k: 50,
+///     trials: 10,
+///     ..Default::default()
+/// };
+/// let results = run_experiment(&config);
+/// for r in &results {
+///     println!("s={} K={} success={:.1}%", r.s, r.k_nodes, r.success_rate * 100.0);
+/// }
+/// ```
 pub fn run_experiment(config: &ExperimentConfig) -> Vec<ConfigResult> {
     let dist = RobustSoliton::new(config.k, config.c, config.delta);
     let epoch_seed = [0u8; 32];
@@ -204,10 +275,28 @@ pub fn run_experiment(config: &ExperimentConfig) -> Vec<ConfigResult> {
     results
 }
 
-/// Run a sweep over total distinct droplets M to find the decoding threshold.
+/// Sweeps over total distinct droplet counts $M$ to locate the decoding threshold.
 ///
-/// This ignores the distributed "node" aspect and treats the problem as a
-/// pure Fountain Code decoding efficiency test.
+/// Ignores the distributed node model entirely: for each value in `m_values`,
+/// the function draws $M$ droplets uniformly from a pool of `pool_size` and
+/// runs the peeling decoder. This isolates the pure fountain code overhead
+/// from network-topology effects.
+///
+/// Returns a `Vec<(M, success_rate, mean_decoded)>` where:
+/// - `M` — number of distinct droplets presented to the decoder.
+/// - `success_rate` — fraction of `trials` where all $k$ blocks were recovered.
+/// - `mean_decoded` — average number of source blocks decoded per trial.
+///
+/// # Examples
+///
+/// ```ignore
+/// use sef::experiment::sweep_total_droplets;
+///
+/// let results = sweep_total_droplets(50, 0.1, 0.05, &[80, 100, 150], 500, 100);
+/// for (m, rate, avg) in &results {
+///     println!("M={m} success={rate:.2} avg_decoded={avg:.1}");
+/// }
+/// ```
 pub fn sweep_total_droplets(
     k: usize,
     c: f64,

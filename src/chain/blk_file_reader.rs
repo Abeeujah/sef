@@ -1,3 +1,13 @@
+//! Backend for reading Bitcoin blocks directly from Bitcoin Core's `blk*.dat` files.
+//!
+//! Handles XOR obfuscation (introduced in Bitcoin Core v28+) by reading the
+//! `xor.dat` key file from the blocks directory. Scans files in sorted order,
+//! then chains blocks by `prev_blockhash` to produce canonical height ordering.
+//!
+//! For production use on mainnet, prefer
+//! [`KernelBlockReader`](super::kernel_reader::KernelBlockReader) which uses
+//! the validated block index and avoids the manual chain-ordering step.
+
 use std::{
     collections::HashMap,
     fs,
@@ -13,22 +23,26 @@ use crate::chain::{
     stream::{BlockSource, RawBlock},
 };
 
-/// Read blocks from Bitcoin Core's `blk*.dat` files one at a time.
+/// Reads blocks from Bitcoin Core's raw `blk*.dat` files.
 ///
-/// Handles XOR obfuscation (Bitcoin Core v28+). Streams blocks in file order,
-/// then chains them by prev_blockhash to produce canonical height order.
-///
-/// Note: for production / mainnet use, prefer `KernelBlockReader` which uses
-/// the validated block index and avoids the chain-ordering step.
+/// Handles XOR obfuscation (Bitcoin Core v28+) and chains blocks by
+/// `prev_blockhash` to produce canonical height ordering. For mainnet
+/// production use, prefer [`KernelBlockReader`](super::kernel_reader::KernelBlockReader)
+/// which uses the validated block index.
 pub struct BlkFileReader {
     blocks_dir: PathBuf,
     xor_key: Vec<u8>,
 }
 
 impl BlkFileReader {
-    /// Opens blocks directory for reading.
+    /// Opens a blocks directory for reading.
     ///
-    /// Reads the XOR key from `xor.dat` if present
+    /// Reads the XOR key from `xor.dat` if present.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::Error`] if `blocks_dir` cannot be read or `xor.dat`
+    /// exists but is unreadable.
     pub fn open(blocks_dir: &Path) -> io::Result<Self> {
         let xor_path = blocks_dir.join("xor.dat");
         let xor_key = if xor_path.exists() {
@@ -111,7 +125,7 @@ impl BlkFileReader {
                 continue;
             }
 
-            let size = usize::from_le_bytes(header_buf[4..8].try_into().unwrap());
+            let size = u32::from_le_bytes(header_buf[4..8].try_into().unwrap()) as usize;
             if size == 0 || size > 4_000_000 {
                 break;
             }
@@ -157,6 +171,9 @@ struct BlockMeta {
     data: Vec<u8>,
 }
 
+/// Two-pass strategy: first scans every `blk*.dat` file to collect all blocks
+/// into memory, then walks the `prev_blockhash` chain from genesis to produce
+/// height-ordered [`RawBlock`]s.
 impl BlockSource for BlkFileReader {
     fn for_each_block(
         &self,

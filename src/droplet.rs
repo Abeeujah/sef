@@ -1,3 +1,32 @@
+//! Core data structures and encoder for LT fountain codes.
+//!
+//! A [`Droplet`] is the fundamental unit of encoded data — a payload formed by
+//! XORing $d$ source blocks, where $d$ is sampled from a
+//! [`DegreeDistribution`] (typicallythe [`RobustSoliton`] distribution).
+//!
+//! The [`Encoder`] generates droplets deterministically from [`EpochParams`],
+//! enabling any peer with the same parameters to independently verify the
+//! encoding graph structure without transmitting it out-of-band.
+//!
+//! Droplets are consumed by [`peeling_decode`](crate::decoder::peeling_decode)
+//! to recover the original source blocks.
+//!
+//! # Examples
+//!
+//! ```
+//! use sef::distribution::RobustSoliton;
+//! use sef::droplet::{EpochParams, Encoder};
+//!
+//! let k = 10;
+//! let blocks: Vec<Vec<u8>> = (0..k).map(|i| vec![i as u8; 64]).collect();
+//! let params = EpochParams::new(0, k as u32, [0u8; 32]);
+//! let rsd = RobustSoliton::new(k, 0.1, 0.5);
+//!
+//! let encoder = Encoder::new(&params, &rsd, &blocks);
+//! let droplet = encoder.generate(0);
+//! assert!(droplet.validate(k as u32).is_ok());
+//! ```
+
 use rand::{SeedableRng, seq::index::sample};
 use rand_chacha::ChaCha8Rng;
 use sha2::{Digest, Sha256};
@@ -10,21 +39,27 @@ use crate::{distribution::DegreeDistribution, xor};
 /// Soliton Distribution and XORing $d$ source blocks together.
 #[derive(Debug, Clone)]
 pub struct Droplet {
-    /// Epoch this droplet belongs to
+    /// Epoch this droplet belongs to, linking it to a specific set of source blocks
+    /// and their shared [`EpochParams`].
     pub epoch_id: u64,
 
-    /// Unique identifier within the epoch (used for deterministic PRNG seed)
+    /// Unique identifier within the epoch. Together with [`EpochParams::epoch_seed`],
+    /// this deterministically derives the per-droplet PRNG — making the encoding
+    /// graph structure reproducible by any peer.
     pub droplet_id: u64,
 
-    /// Sorted, unique indices of source blocks in $[0, k)$ used to form the payload.
-    /// The length of this vector corresponds to the sampled degree.
+    /// Sorted, unique indices of source blocks in $[0, K)$ that were XORed to
+    /// form [`payload`](Droplet::payload). The length of this vector equals the
+    /// sampled degree $d$.
     pub indices: Vec<u32>,
 
-    /// The size of the largest source block before padding.
-    /// Essential for truncating the final decoded output to its original size.
+    /// Byte length of the longest source block among those selected, used as the
+    /// canonical payload size. Shorter blocks are implicitly zero-padded to this
+    /// length during XOR; the decoder uses it to truncate recovered blocks to
+    /// their original size.
     pub padded_len: u32,
 
-    /// The XOR'd payload
+    /// The XOR-combined payload of the $d$ selected source blocks.
     pub payload: Vec<u8>,
 }
 
@@ -45,11 +80,21 @@ pub struct EpochParams {
 
     /// Root seed used to deterministically derive droplet-specific
     /// PRNGs. This ensures that the set of source block indices
-    /// for `droplet_id` $N$ is stable accross all peers.
+    /// for `droplet_id` $N$ is stable across all peers.
     pub epoch_seed: [u8; 32],
 }
 
 impl EpochParams {
+    /// Constructs a new [`EpochParams`] from the given identifiers and seed.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use sef::droplet::EpochParams;
+    ///
+    /// let params = EpochParams::new(1, 256, [0xAB; 32]);
+    /// assert_eq!(params.k, 256);
+    /// ```
     pub fn new(epoch_id: u64, k: u32, epoch_seed: [u8; 32]) -> Self {
         Self {
             epoch_id,
@@ -78,29 +123,43 @@ impl EpochParams {
     }
 }
 
-/// An LT-code encoder that generates `Droplet`s from a fixed set of source blocks.
+/// An LT-code encoder that generates [`Droplet`]s from a fixed set of source blocks.
 ///
-/// This encoder acts as a "view" over the source data and does not perform
-/// its own allocations for the block storage.
+/// Borrows all inputs (zero-copy) and is parameterized over any
+/// [`DegreeDistribution`], making it usable with [`RobustSoliton`](crate::distribution::RobustSoliton)
+/// or custom distributions for testing.
 pub struct Encoder<'e, D: DegreeDistribution> {
     /// Configuration and root seed for this encoding session.
     params: &'e EpochParams,
 
-    /// The probability distribution (Robust Soliton) used to
-    /// sample the degree for each new droplet.
+    /// The probability distribution used to sample the degree for each new droplet.
     dist: &'e D,
 
     /// The source data split into $K$ blocks.
-    /// Note: If blocks are non-uniform in length, they are implicitly
+    /// If blocks are non-uniform in length, they are implicitly
     /// zero-padded to the maximum block size during XOR operations.
     blocks: &'e [Vec<u8>],
 }
 
 impl<'e, D: DegreeDistribution> Encoder<'e, D> {
-    /// Create a new encoder.
+    /// Creates a new encoder over the given source blocks.
     ///
     /// # Panics
+    ///
     /// Panics if `blocks.len() != params.k`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use sef::distribution::RobustSoliton;
+    /// use sef::droplet::{EpochParams, Encoder};
+    ///
+    /// let k = 8;
+    /// let blocks: Vec<Vec<u8>> = (0..k).map(|i| vec![i as u8; 32]).collect();
+    /// let params = EpochParams::new(0, k as u32, [0u8; 32]);
+    /// let rsd = RobustSoliton::new(k, 0.1, 0.5);
+    /// let encoder = Encoder::new(&params, &rsd, &blocks);
+    /// ```
     pub fn new(params: &'e EpochParams, dist: &'e D, blocks: &'e [Vec<u8>]) -> Self {
         assert_eq!(
             blocks.len(),
@@ -116,16 +175,17 @@ impl<'e, D: DegreeDistribution> Encoder<'e, D> {
         }
     }
 
-    /// Generates a single `Droplet` for a specific `droplet_id`.
+    /// Generates a single [`Droplet`] for a specific `droplet_id`.
     ///
     /// This process follows the standard LT-code encoding pipeline:
     /// 1. Seed a PRNG with domain separation (epoch + droplet).
-    /// 2. Sample a degree $d$ from the Robust Soliton Distribution.
+    /// 2. Sample a degree $d$ from the [`DegreeDistribution`].
     /// 3. Randomly select $d$ unique source block indices.
     /// 4. XOR the selected blocks together to form the droplet payload.
     ///
-    /// The resulting `Droplet` is stateless and can be generated
-    /// inadequately of any other droplets in the same epoch.
+    /// The resulting [`Droplet`] is stateless and can be generated
+    /// independently of any other droplets in the same epoch. The
+    /// consumer is typically [`peeling_decode`](crate::decoder::peeling_decode).
     pub fn generate(&self, droplet_id: u64) -> Droplet {
         let k = self.params.k as usize;
         let mut rng = self.params.droplet_rng(droplet_id);
@@ -158,7 +218,8 @@ impl<'e, D: DegreeDistribution> Encoder<'e, D> {
         }
     }
 
-    /// Generate `n` droplets with sequential IDs starting from 0.
+    /// Convenience wrapper that generates `n` [`Droplet`]s with sequential IDs
+    /// `0..n` via repeated calls to [`generate`](Encoder::generate).
     pub fn generate_n(&self, n: u64) -> Vec<Droplet> {
         (0..n).map(|id| self.generate(id)).collect()
     }

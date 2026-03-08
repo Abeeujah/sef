@@ -1,5 +1,7 @@
 use std::{ops::ControlFlow, path::Path, time::Instant};
 
+#[cfg(not(feature = "kernel"))]
+use sef::chain::blk_file_reader::BlkFileReader;
 use bitcoin::consensus::deserialize;
 use sef::{
     chain::{error::ChainError, stream::EpochBatch},
@@ -235,7 +237,7 @@ pub fn run(
     }
     #[cfg(not(feature = "kernel"))]
     {
-        use sef::chain::blk_file_reader::BlkFileReader;
+        use sef::chain::stream::for_each_epoch;
 
         let source = BlkFileReader::open(blocks_dir)?;
         for_each_epoch(&source, cfg.k, cfg.buffer, &mut epoch_visitor)?;

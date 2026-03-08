@@ -1,4 +1,5 @@
 mod chain_info;
+mod decode;
 mod dist_info;
 mod experiment;
 mod generate;
@@ -32,6 +33,13 @@ pub fn dispatch(command: Commands) -> Result<(), Box<dyn std::error::Error>> {
                 symbol_size,
             };
             generate::run(&blocks_dir, &output, &cfg)?;
+        }
+        Commands::Decode {
+            input,
+            output,
+            epoch,
+        } => {
+            decode::run(&input, &output, epoch)?;
         }
         Commands::ChainInfo { blocks_dir } => {
             chain_info::run(&blocks_dir)?;

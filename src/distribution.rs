@@ -1,3 +1,37 @@
+//! Degree distribution trait and the Robust Soliton Distribution (RSD) for LT codes.
+//!
+//! This module defines [`DegreeDistribution`], the abstraction over how many source
+//! blocks each encoded droplet combines, and provides the canonical implementation
+//! [`RobustSoliton`] — the probability distribution at the heart of Luby Transform
+//! codes.
+//!
+//! The RSD augments the Ideal Soliton Distribution with a "spike" at degree
+//! $d = \lfloor K / S \rfloor$ (where $S = c \sqrt{K} \ln(K/\delta)$) to maintain
+//! the decoding *ripple* — the set of degree-1 packets available to the peeling
+//! decoder at each step. Without this spike, the ripple collapses to zero with
+//! high probability before all source symbols are recovered.
+//!
+//! **Reference:** M. Luby, "LT Codes", *Proc. 43rd Annual IEEE Symposium on
+//! Foundations of Computer Science (FOCS)*, 2002.
+//!
+//! # Examples
+//!
+//! ```
+//! use sef::distribution::{RobustSoliton, DegreeDistribution};
+//! use rand::SeedableRng;
+//! use rand_chacha::ChaCha8Rng;
+//!
+//! let k = 256;
+//! let rsd = RobustSoliton::new(k, 0.1, 0.05);
+//!
+//! let mut rng = ChaCha8Rng::seed_from_u64(0);
+//! let degree = rsd.sample_degree(&mut rng);
+//! assert!((1..=k).contains(&degree));
+//!
+//! let avg = rsd.expected_degree();
+//! assert!(avg > 0.0);
+//! ```
+
 use rand::Rng;
 
 /// Trait for swappable degree distributions in fountain codes.
@@ -5,15 +39,18 @@ use rand::Rng;
 /// Implementations define how many source symbols are combined into a
 /// single encoded packet (the "degree").
 pub trait DegreeDistribution {
-    /// Samples a degree $d$ such that $1 \le d \le k$ for a given block size `k`.
+    /// Samples a degree $d$ satisfying the contract $1 \le d \le K$.
     ///
-    /// This represents the number of source symbols to be XORed together.
+    /// Implementations **must** guarantee the returned value lies in $[1, K]$,
+    /// where $K$ is the number of source blocks. Values outside this range
+    /// will cause out-of-bounds index selection during encoding.
     fn sample_degree<R: Rng + ?Sized>(&self, rng: &mut R) -> usize;
 
-    /// Computes the expected value $E[D]$ of the distribution for a block size `k`.
+    /// Computes the expected value $E[D]$ of the distribution.
     ///
-    /// This is typically used to estimate the average number of XOR operations
-    /// per packet or to calculate theoretical overhead.
+    /// Used for overhead estimation and diagnostic reporting. The value
+    /// reflects the average number of XOR operations per encoded packet
+    /// under the current parameterization.
     fn expected_degree(&self) -> f64;
 }
 
@@ -21,28 +58,51 @@ pub trait DegreeDistribution {
 ///
 /// The RSD is designed to ensure that a decoder can always find a degree-1
 /// packet to start the ripple, while maintaining enough high-degree packets
-/// to cover all source symbols.
+/// to cover all source symbols. It is parameterized by a tuning constant
+/// [`c`](RobustSoliton::c) and a failure bound [`delta`](RobustSoliton::delta).
 pub struct RobustSoliton {
-    /// Tuning constant that determines the number of degree-1 packets.
-    /// Lower values increase efficiency but risk decoder stalls.
+    /// Free parameter that scales the spike magnitude $S = c \sqrt{K} \ln(K/\delta)$.
+    ///
+    /// Smaller values reduce overhead (fewer redundant droplets needed) at
+    /// the cost of a thinner ripple and higher decoding-failure probability.
     pub c: f64,
 
-    /// The probability that the decoding fails after receiving $K \cdot (1 + \epsilon)$ symbols.
+    /// Upper bound on decoding-failure probability after receiving
+    /// $K \cdot (1 + \varepsilon)$ encoded symbols.
+    ///
+    /// Appears in $S = c \sqrt{K} \ln(K/\delta)$; tighter bounds (smaller
+    /// `delta`) widen the spike and increase the expected degree.
     pub delta: f64,
 
-    /// Cached cumulative distribution function (CDF).
-    /// Used for $O(\log d)$ degree sampling via binary search.
+    /// Pre-computed cumulative distribution function over degrees $[0, K]$.
+    ///
+    /// Entry `cdf[d]` equals $\Pr[D \le d]$. Built once in [`RobustSoliton::new`]
+    /// (or [`rebuild`](RobustSoliton::rebuild)) and enables $O(\log K)$
+    /// degree sampling via binary search.
     cdf: Vec<f64>,
 
-    /// The number of source symbols (block size) for which `cdf` was generated.
+    /// The number of source symbols ($K$) for which [`cdf`](RobustSoliton) was computed.
     k: usize,
 }
 
 impl RobustSoliton {
-    /// Create a new Robust Soliton Distribution for epoch size `k`.
+    /// Creates a new [`RobustSoliton`] distribution for epoch size `k`.
+    ///
+    /// Pre-computes the CDF over degrees $[1, k]$ so that subsequent calls
+    /// to [`sample_degree`](DegreeDistribution::sample_degree) are $O(\log k)$.
     ///
     /// # Panics
-    /// Panics if `k == 0`, `c <= 0.0`, or `delta` is not in the range (0, 1).
+    ///
+    /// Panics if `k == 0`, `c <= 0.0`, or `delta` is not in the range $(0, 1)$.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use sef::distribution::RobustSoliton;
+    ///
+    /// let rsd = RobustSoliton::new(1024, 0.1, 0.05);
+    /// assert_eq!(rsd.k(), 1024);
+    /// ```
     pub fn new(k: usize, c: f64, delta: f64) -> Self {
         assert!(k > 0, "epoch size k must be > 0");
         assert!(c > 0.0, "c must be > 0.0");
@@ -52,11 +112,13 @@ impl RobustSoliton {
         Self { c, delta, cdf, k }
     }
 
-    /// Rebuilds the CDF for a new epoch size `k`.
+    /// Rebuilds the CDF for a new epoch size `k`, retaining [`c`](RobustSoliton::c)
+    /// and [`delta`](RobustSoliton::delta).
     ///
-    /// This is an $O(k)$ operation. Use this when the source block size
-    /// changes while keeping the same tuning parameters.
+    /// This is an $O(k)$ operation. A no-op if `k` equals the current value.
+    ///
     /// # Panics
+    ///
     /// Panics if `k == 0`.
     pub fn rebuild(&mut self, k: usize) {
         assert!(k > 0, "epoch size k must be > 0");
@@ -67,7 +129,11 @@ impl RobustSoliton {
         self.k = k;
     }
 
-    /// Returns the block size (k) for which this distribution was built.
+    /// Returns the source-block count $K$ for which the CDF is currently computed.
+    ///
+    /// Relevant when reusing a single [`RobustSoliton`] instance across epochs
+    /// of different sizes — call [`rebuild`](RobustSoliton::rebuild) whenever
+    /// `k` changes.
     pub fn k(&self) -> usize {
         self.k
     }
@@ -115,6 +181,8 @@ impl RobustSoliton {
 }
 
 impl DegreeDistribution for RobustSoliton {
+    /// Draws a uniform variate $u \in [0, 1)$ and performs a binary search
+    /// over the pre-computed CDF to return the corresponding degree in $[1, K]$.
     fn sample_degree<R: Rng + ?Sized>(&self, rng: &mut R) -> usize {
         let u: f64 = rng.r#gen();
 
@@ -128,6 +196,8 @@ impl DegreeDistribution for RobustSoliton {
         (idx + 1).clamp(1, self.k)
     }
 
+    /// Computes $E[D] = \sum_{d=1}^{K} d \cdot p(d)$ by differencing consecutive
+    /// CDF entries to recover each probability mass $p(d)$.
     fn expected_degree(&self) -> f64 {
         self.cdf[..=self.k]
             .windows(2)

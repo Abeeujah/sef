@@ -1,11 +1,33 @@
-/// XOR two byte slices with adaptive zero-padding.
+//! Bitwise XOR primitives with adaptive zero-padding for the fountain encoder
+//! and decoder pipelines.
+//!
+//! XOR is the core algebraic operation in LT codes. During encoding,
+//! [`Encoder::generate`](crate::droplet::Encoder::generate) forms each
+//! [`Droplet`](crate::droplet::Droplet) by XORing $d$ source blocks together.
+//! During decoding, the peeling algorithm recovers source blocks by XORing
+//! already-recovered blocks *out* of higher-degree droplets, reducing their
+//! degree until new singletons emerge.
+//!
+//! All functions in this module treat shorter operands as implicitly
+//! zero-padded to the length of the longest operand, so variable-size
+//! Bitcoin blocks can be combined without pre-normalization.
+//!
+//! ```
+//! use sef::xor::xor_bytes;
+//!
+//! let a = vec![0xFF, 0x00];
+//! let b = vec![0x0F, 0xF0, 0x55]; // implicitly pads `a` with 0x00
+//! assert_eq!(xor_bytes(&a, &b), vec![0xF0, 0xF0, 0x55]);
+//! ```
+
+/// XORs two byte slices with adaptive zero-padding, returning a new allocation.
 ///
-/// If the slices differ in length, the operation behaves as if the shorter slice
-/// were zero-padded to match the longer one. This ensures that smaller metadata
-///  blocks can be combined with larger payload blocks without truncation.
+/// Produces a `Vec<u8>` of length `max(a.len(), b.len())`. When the slices
+/// differ in length the shorter one is treated as if zero-padded, allowing
+/// variable-size blocks (e.g., metadata vs. payload) to be combined without
+/// prior normalization.
 ///
-/// # Returns
-/// A `Vec<u8>` with length `max(a.len(), b.len())`.
+/// Primarily used during encoding to combine pairs of source blocks.
 pub fn xor_bytes(a: &[u8], b: &[u8]) -> Vec<u8> {
     let (short, long) = if a.len() < b.len() { (a, b) } else { (b, a) };
     let mut result = long.to_vec();
@@ -16,12 +38,13 @@ pub fn xor_bytes(a: &[u8], b: &[u8]) -> Vec<u8> {
     result
 }
 
-/// XORs `block` into `buf`, extending `buf` if necessary.
+/// XORs `block` into `buf` in place, extending `buf` if `block` is longer.
 ///
-/// If `block` is longer than `buf`, `buf` is extended to match the length
-/// of `block`. Existing bytes in `buf` are XOR'd with the corresponding
-/// bytes from `block`, while any additional bytes from `block` are
-/// appended directly to `buf`.
+/// Mutates `buf` by XORing each existing byte with the corresponding byte
+/// from `block`. If `block` is longer than `buf`, the surplus bytes are
+/// appended verbatim (equivalent to XOR with zero). This grow-on-demand
+/// behavior supports the encoder's accumulation loop where the running
+/// buffer starts empty and absorbs blocks of varying lengths.
 pub fn xor_into(buf: &mut Vec<u8>, block: &[u8]) {
     let buf_len = buf.len();
     let block_len = block.len();
@@ -33,10 +56,12 @@ pub fn xor_into(buf: &mut Vec<u8>, block: &[u8]) {
     }
 }
 
-/// XOR src into a fixed-size destination without resizing.
+/// XORs `src` into a fixed-size `dst` buffer without resizing.
 ///
-/// Returns `false` if `src` is longer than `dst` (caller should treat as error).
-/// Used during peeling decode where payload growth indicates a malformed droplet.
+/// Returns `false` if `src.len() > dst.len()`, signalling that the droplet
+/// payload grew beyond the expected padded length — a reliable corruption
+/// indicator during the peeling decode. Callers should treat a `false`
+/// return as a [`VerifyError`](crate::decoder::VerifyError)-level fault.
 pub fn xor_into_fixed(dst: &mut [u8], src: &[u8]) -> bool {
     if src.len() > dst.len() {
         return false;
@@ -47,14 +72,15 @@ pub fn xor_into_fixed(dst: &mut [u8], src: &[u8]) -> bool {
     true
 }
 
-/// XORs multiple byte slices together with adaptive zero-padding.
+/// Folds an arbitrary number of byte slices into a single XOR result.
 ///
-/// Each slice is XOR'd into the result. If slices have different lengths,
-/// they are treated as if they were zero-padded to the length of the longest slice.
+/// This is the primary multi-block XOR used by
+/// [`Encoder::generate`](crate::droplet::Encoder::generate) to form a
+/// droplet payload from $d$ source blocks. Shorter slices are implicitly
+/// zero-padded to the length of the longest slice.
 ///
-/// # Returns
-/// A `Vec<u8>` with length equal to the longest input slice.
-/// If the input is empty, an empty `Vec` is returned.
+/// Returns a `Vec<u8>` of length `max(blocks[i].len())`, or an empty
+/// `Vec` if `blocks` is empty.
 pub fn xor_blocks(blocks: &[&[u8]]) -> Vec<u8> {
     let max_len = blocks.iter().map(|b| b.len()).max().unwrap_or(0);
     let mut result = vec![0u8; max_len];

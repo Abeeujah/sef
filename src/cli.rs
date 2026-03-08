@@ -102,6 +102,21 @@ pub enum Commands {
         symbol_size: usize,
     },
 
+    /// Decode droplets back into source blocks
+    Decode {
+        /// Path to the droplets directory (containing epoch_N/ subdirectories)
+        #[arg(short, long, default_value = "droplets")]
+        input: PathBuf,
+
+        /// Output directory for recovered block files
+        #[arg(short, long, default_value = "decoded")]
+        output: PathBuf,
+
+        /// Only decode this epoch index (optional)
+        #[arg(long)]
+        epoch: Option<usize>,
+    },
+
     /// Print help information
     Help,
 
