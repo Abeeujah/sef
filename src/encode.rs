@@ -95,6 +95,54 @@ pub fn droplet_filename(epoch_id: u64, droplet_id: u64) -> String {
     format!("epoch_{}_droplet_{}.bin", epoch_id, droplet_id)
 }
 
+/// Encodes a droplet directly from borrowed buffers, avoiding allocation.
+///
+/// This writes the same wire format as the [`Encodable`] impl on [`Droplet`]
+/// but operates on borrowed slices so the caller can reuse buffers across
+/// droplets.
+pub fn encode_droplet_from_parts<W: bitcoin::io::Write + ?Sized>(
+    writer: &mut W,
+    epoch_id: u64,
+    droplet_id: u64,
+    indices: &[u32],
+    padded_len: u32,
+    payload: &[u8],
+) -> Result<usize, bitcoin::io::Error> {
+    let mut len = 0;
+    len += epoch_id.consensus_encode(writer)?;
+    len += droplet_id.consensus_encode(writer)?;
+    len += VarInt(indices.len() as u64).consensus_encode(writer)?;
+    for &idx in indices {
+        len += idx.consensus_encode(writer)?;
+    }
+    len += padded_len.consensus_encode(writer)?;
+    len += VarInt(payload.len() as u64).consensus_encode(writer)?;
+    writer.write_all(payload)?;
+    len += payload.len();
+    Ok(len)
+}
+
+/// Reads all droplets from a single concatenated epoch file.
+///
+/// The file contains back-to-back consensus-encoded [`Droplet`]s written by
+/// the batched encoder. Returns all successfully decoded droplets; stops
+/// cleanly at EOF.
+pub fn read_epoch_droplets(path: &std::path::Path) -> io::Result<Vec<Droplet>> {
+    let data = std::fs::read(path)?;
+    let mut droplets = Vec::new();
+    let mut cursor = std::io::Cursor::new(&data);
+    let total = data.len() as u64;
+
+    while cursor.position() < total {
+        match Droplet::consensus_decode_from_finite_reader(&mut cursor) {
+            Ok(d) => droplets.push(d),
+            Err(_) => break,
+        }
+    }
+
+    Ok(droplets)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

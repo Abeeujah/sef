@@ -11,8 +11,8 @@
 //! use sef::epoch::{compute_epoch_seed, auto_scale_droplets};
 //!
 //! let seed = compute_epoch_seed(0, "000000000019d6689c085ae165831e93");
-//! let n = auto_scale_droplets(100, 0); // auto: 100 * 3 = 300
-//! assert_eq!(n, 300);
+//! let n = auto_scale_droplets(100, 0); // auto: theory-backed formula
+//! assert_eq!(n, 253);
 //! ```
 
 use sha2::{Digest, Sha256};
@@ -70,25 +70,20 @@ pub fn compute_epoch_seed(epoch_idx: usize, first_block_hash: &str) -> [u8; 32] 
 
 /// Selects the droplet count $N$ when the user requests auto-scaling (`n == 0`).
 ///
-/// Applies tiered multipliers to the source-unit count $K$:
-///
-/// | $K$         | Multiplier | Rationale |
-/// |-------------|------------|-----------|
-/// | $< 50$      | $5\times$  | Small epochs suffer proportionally higher RSD overhead; extra droplets ensure the ripple never stalls. |
-/// | $50 – 199$  | $3\times$  | Moderate overhead; standard safety margin. |
-/// | $\ge 200$   | $2\times$  | Large $K$ concentrates the RSD well; minimal surplus needed. |
+/// Uses the LT-code overhead formula $N = K + c_s \sqrt{K} \ln(K / \delta)$
+/// with $\delta = 0.05$ and $c_s = 2.0$, derived from the standard Robust
+/// Soliton decoding requirement. The result is at least $K + 1$.
 ///
 /// If `n` is already nonzero it is returned unchanged.
 pub fn auto_scale_droplets(unit_k: usize, n: u64) -> u64 {
     if n == 0 {
-        let multiplier = if unit_k < 50 {
-            5
-        } else if unit_k < 200 {
-            3
-        } else {
-            2
-        };
-        (unit_k as u64) * multiplier
+        let k = unit_k as f64;
+        // LT overhead: N = k + safety * sqrt(K) * ln(K / delta)
+        let delta = 0.05_f64;
+        let safety = 2.0_f64;
+        let overhead = safety * k.sqrt() * (k / delta).ln();
+        let n = k + overhead;
+        (n.ceil() as u64).max(unit_k as u64 + 1)
     } else {
         n
     }
