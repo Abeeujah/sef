@@ -218,6 +218,40 @@ impl<'e, D: DegreeDistribution> Encoder<'e, D> {
         }
     }
 
+    ///Generates a droplet into caller-supplied buffers, avoiding per-droplet allocation.
+    ///
+    /// `indices_buf` is cleared and filled with the sampled indices.
+    /// `payload_buf` must be at least as long as the longest source block; it is
+    /// zeroed and filled with the XOR result.
+    ///
+    /// Returns the degree (number of indices) and padded length so the caller
+    /// can construct or serialize the droplet without further allocation.
+    pub fn generate_into(
+        &self,
+        droplet_id: u64,
+        indices_buf: &mut Vec<u32>,
+        payload_buf: &mut [u8],
+    ) -> (usize, u32) {
+        let k = self.params.k as usize;
+        let mut rng = self.params.droplet_rng(droplet_id);
+
+        let degree = self.dist.sample_degree(&mut rng);
+
+        indices_buf.clear();
+        indices_buf.extend(sample(&mut rng, k, degree).into_iter().map(|i| i as u32));
+        indices_buf.sort_unstable();
+
+        let selected_blocks: Vec<&[u8]> = indices_buf
+            .iter()
+            .map(|&i| self.blocks[i as usize].as_slice())
+            .collect();
+
+        let padded_len = selected_blocks.iter().map(|b| b.len()).max().unwrap_or(0);
+        xor::xor_blocks_into(&mut payload_buf[..padded_len], &selected_blocks);
+
+        (degree, padded_len as u32)
+    }
+
     /// Convenience wrapper that generates `n` [`Droplet`]s with sequential IDs
     /// `0..n` via repeated calls to [`generate`](Encoder::generate).
     pub fn generate_n(&self, n: u64) -> Vec<Droplet> {

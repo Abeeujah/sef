@@ -72,6 +72,18 @@ pub fn xor_into_fixed(dst: &mut [u8], src: &[u8]) -> bool {
     true
 }
 
+/// Folds source blocks into an existing buffer via XOR, avoiding allocation.
+///
+/// The caller must ensure `buf.len() >= max(blocks[i].len())`.
+/// The buffer is zeroed before XOR accumulation.
+/// The buffer is zeroed before XOR accumulation.
+pub fn xor_blocks_into(buf: &mut [u8], blocks: &[&[u8]]) {
+    buf.fill(0);
+    for block in blocks {
+        xor_block_into(buf, block);
+    }
+}
+
 /// Folds an arbitrary number of byte slices into a single XOR result.
 ///
 /// This is the primary multi-block XOR used by
@@ -84,14 +96,31 @@ pub fn xor_into_fixed(dst: &mut [u8], src: &[u8]) -> bool {
 pub fn xor_blocks(blocks: &[&[u8]]) -> Vec<u8> {
     let max_len = blocks.iter().map(|b| b.len()).max().unwrap_or(0);
     let mut result = vec![0u8; max_len];
+    xor_blocks_into(&mut result, blocks);
+    result
+}
 
-    for block in blocks {
-        for (r, &b) in result[..block.len()].iter_mut().zip(block.iter()) {
-            *r ^= b;
-        }
+#[inline]
+fn xor_block_into(buf: &mut [u8], block: &[u8]) {
+    let len = block.len();
+    let chunks = len / 8;
+    let remainder = len % 8;
+
+    // SAFETY: both pointers are valid, aligned (u64 needs 8-byte alignment —
+    // upheld by the allocator for heap Vec/slice buffers), and non-overlapping.
+    let buf_u64: &mut [u64] =
+        unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr().cast::<u64>(), chunks) };
+    let block_u64: &[u64] =
+        unsafe { std::slice::from_raw_parts(block.as_ptr().cast::<u64>(), chunks) };
+
+    for (r, &b) in buf_u64.iter_mut().zip(block_u64) {
+        *r ^= b;
     }
 
-    result
+    let tail_start = chunks * 8;
+    for i in 0..remainder {
+        buf[tail_start + i] ^= block[tail_start + i];
+    }
 }
 
 #[cfg(test)]
