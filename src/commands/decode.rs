@@ -1,13 +1,8 @@
-use std::{
-    io::Write,
-    path::Path,
-    time::Instant,
-};
+use std::{io::Write, path::Path, time::Instant};
 
 use sef::{
     decoder::{self, SymbolVerifier},
-    encode,
-    symbol,
+    encode, symbol,
 };
 
 /// Bitcoin signet network magic bytes.
@@ -30,14 +25,12 @@ pub fn run(
         let entry = entry?;
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
-        if entry.file_type()?.is_dir() {
-            if let Some(idx_str) = name_str.strip_prefix("epoch_") {
-                if let Ok(idx) = idx_str.parse::<usize>() {
-                    if epoch_filter.is_none() || epoch_filter == Some(idx) {
-                        epoch_dirs.push((idx, entry.path()));
-                    }
-                }
-            }
+        if entry.file_type()?.is_dir()
+            && let Some(idx_str) = name_str.strip_prefix("epoch_")
+            && let Ok(idx) = idx_str.parse::<usize>()
+            && (epoch_filter.is_none() || epoch_filter == Some(idx))
+        {
+            epoch_dirs.push((idx, entry.path()));
         }
     }
     epoch_dirs.sort_by_key(|(idx, _)| *idx);
@@ -60,12 +53,13 @@ pub fn run(
     let mut blk_file: Option<std::io::BufWriter<std::fs::File>> = None;
     let mut blk_file_bytes = 0u64;
 
-    let open_next_blk =
-        |output: &Path, idx: &mut u32| -> Result<std::io::BufWriter<std::fs::File>, std::io::Error> {
-            let path = output.join(format!("blk{:05}.dat", idx));
-            *idx += 1;
-            Ok(std::io::BufWriter::new(std::fs::File::create(path)?))
-        };
+    let open_next_blk = |output: &Path,
+                         idx: &mut u32|
+     -> Result<std::io::BufWriter<std::fs::File>, std::io::Error> {
+        let path = output.join(format!("blk{:05}.dat", idx));
+        *idx += 1;
+        Ok(std::io::BufWriter::new(std::fs::File::create(path)?))
+    };
 
     for (epoch_idx, epoch_dir) in &epoch_dirs {
         let manifest_path = epoch_dir.join("manifest.bin");
@@ -129,7 +123,9 @@ pub fn run(
 
             for block_data in recovered_blocks.iter().flatten() {
                 // Rotate blk file if needed
-                if blk_file.is_none() || blk_file_bytes + block_data.len() as u64 + 8 > MAX_BLK_FILE_SIZE {
+                if blk_file.is_none()
+                    || blk_file_bytes + block_data.len() as u64 + 8 > MAX_BLK_FILE_SIZE
+                {
                     if let Some(ref mut f) = blk_file {
                         f.flush()?;
                     }
@@ -204,10 +200,7 @@ pub fn run(
         total_recovered_bytes as f64 / 1e6
     );
     println!("  Droplets loaded:    {}", total_droplets_loaded);
-    println!(
-        "  Output files:       {} blk*.dat file(s)",
-        blk_file_idx
-    );
+    println!("  Output files:       {} blk*.dat file(s)", blk_file_idx);
     println!("  Total time:         {:.2}s", t0.elapsed().as_secs_f64());
     println!(
         "  Output directory:   {}",

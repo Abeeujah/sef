@@ -118,7 +118,7 @@ pub fn blocks_to_symbols(blocks: &[Vec<u8>], symbol_size: usize) -> (Vec<Vec<u8>
     let total_symbols = if total_bytes == 0 {
         0
     } else {
-        (total_bytes + symbol_size - 1) / symbol_size
+        total_bytes.div_ceil(symbol_size)
     };
 
     // Stream blocks directly into fixed-size symbol buffers (no intermediate concat)
@@ -190,9 +190,7 @@ pub fn symbols_to_blocks(
             let last_sym = (byte_offset + true_len - 1) / sym_size;
 
             for si in first_sym..=last_sym {
-                if symbols.get(si).and_then(|s| s.as_ref()).is_none() {
-                    return None;
-                }
+                symbols.get(si).and_then(|s| s.as_ref())?;
             }
 
             let mut block = Vec::with_capacity(true_len);
@@ -307,6 +305,7 @@ pub fn deserialize_manifest(data: &[u8]) -> Result<SymbolManifest, encode::Error
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::slice::from_ref;
 
     #[test]
     fn test_roundtrip_identical_blocks() {
@@ -376,7 +375,7 @@ mod tests {
     fn test_zero_padding_only_last_symbol() {
         // 100 bytes → 1 symbol, last 3996 bytes are zeros
         let block = vec![0xFF; 100];
-        let (symbols, _manifest) = blocks_to_symbols(&[block.clone()], 4096);
+        let (symbols, _manifest) = blocks_to_symbols(from_ref(&block), 4096);
 
         assert_eq!(symbols.len(), 1);
         assert_eq!(&symbols[0][..100], &[0xFF; 100]);
@@ -387,7 +386,7 @@ mod tests {
     fn test_multi_symbol_single_block() {
         // 5000 bytes → ceil(5000/4096) = 2 symbols
         let block: Vec<u8> = (0..5000).map(|i| (i % 256) as u8).collect();
-        let (symbols, _manifest) = blocks_to_symbols(&[block.clone()], 4096);
+        let (symbols, _manifest) = blocks_to_symbols(from_ref(&block), 4096);
 
         assert_eq!(symbols.len(), 2);
         assert_eq!(&symbols[0], &block[..4096]);
@@ -457,7 +456,7 @@ mod tests {
     #[test]
     fn test_small_symbol_size() {
         let block = vec![0xAB; 10];
-        let (symbols, _manifest) = blocks_to_symbols(&[block.clone()], 3);
+        let (symbols, _manifest) = blocks_to_symbols(from_ref(&block), 3);
 
         assert_eq!(symbols.len(), 4); // ceil(10/3) = 4
 
@@ -469,7 +468,7 @@ mod tests {
     #[test]
     fn test_exact_multiple_no_extra_padding() {
         let block = vec![0xCC; 8192]; // Exactly 2 * 4096
-        let (symbols, _manifest) = blocks_to_symbols(&[block.clone()], 4096);
+        let (symbols, _manifest) = blocks_to_symbols(from_ref(&block), 4096);
 
         assert_eq!(symbols.len(), 2);
         assert_eq!(symbols[0], block[..4096]);

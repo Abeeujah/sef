@@ -429,8 +429,8 @@ pub fn peeling_decode(
 
     // Queue of singleton droplets
     let mut queue: VecDeque<usize> = VecDeque::new();
-    for di in 0..remaining_degree.len() {
-        if remaining_degree[di] == 1 {
+    for (di, rd) in remaining_degree.iter().enumerate() {
+        if *rd == 1 {
             queue.push_back(di);
         }
     }
@@ -500,8 +500,8 @@ pub fn peeling_decode(
 
     // Build failure analysis for undecoded blocks
     let mut failures = Vec::new();
-    for i in 0..k {
-        if decoded[i].is_none() {
+    for (i, dec) in decoded.iter().enumerate().take(k) {
+        if dec.is_none() {
             let referenced_by = block_to_droplets
                 .get(&(i as u32))
                 .map(|v| v.iter().filter(|&&di| !droplet_disabled[di]).count())

@@ -213,15 +213,11 @@ impl BlockSource for BlkFileReader {
         let mut current = gen_hash;
         let mut height = 0;
 
-        loop {
-            let meta = match blocks_by_hash.remove(&current) {
-                Some(m) => m,
-                None => break,
-            };
+        while let Some(m) = blocks_by_hash.remove(&current) {
             let block = RawBlock {
                 height,
-                hash: meta.hash.to_string(),
-                data: meta.data,
+                hash: m.hash.to_string(),
+                data: m.data,
             };
 
             if let ControlFlow::Break(()) = visitor(block)? {

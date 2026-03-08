@@ -1,8 +1,8 @@
 use std::{ops::ControlFlow, path::Path, time::Instant};
 
+use bitcoin::consensus::deserialize;
 #[cfg(not(feature = "kernel"))]
 use sef::chain::blk_file_reader::BlkFileReader;
-use bitcoin::consensus::deserialize;
 use sef::{
     chain::{error::ChainError, stream::EpochBatch},
     decoder::{self, BitcoinBlockVerifier, SymbolVerifier},
@@ -38,10 +38,10 @@ pub fn run(
     let mut had_epochs = false;
 
     let mut epoch_visitor = |batch: EpochBatch| -> Result<ControlFlow<()>, ChainError> {
-        if let Some(target) = epoch_filter {
-            if batch.index != target {
-                return Ok(ControlFlow::Continue(()));
-            }
+        if let Some(target) = epoch_filter
+            && batch.index != target
+        {
+            return Ok(ControlFlow::Continue(()));
         }
 
         had_epochs = true;
@@ -157,17 +157,17 @@ pub fn run(
         let mut byte_match = true;
         if decode_result_success {
             for (i, recovered) in recovered_blocks.iter().enumerate() {
-                if let Some(recovered) = recovered {
-                    if recovered != &block_data[i] {
-                        println!(
-                            "  WARNING: Epoch {} block {} recovered but bytes differ! ({} vs {} bytes)",
-                            epoch_idx,
-                            i,
-                            recovered.len(),
-                            block_data[i].len()
-                        );
-                        byte_match = false;
-                    }
+                if let Some(recovered) = recovered
+                    && recovered != &block_data[i]
+                {
+                    println!(
+                        "  WARNING: Epoch {} block {} recovered but bytes differ! ({} vs {} bytes)",
+                        epoch_idx,
+                        i,
+                        recovered.len(),
+                        block_data[i].len()
+                    );
+                    byte_match = false;
                 }
             }
         }
