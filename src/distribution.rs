@@ -141,7 +141,7 @@ impl RobustSoliton {
     fn build_cdf(k: usize, c: f64, delta: f64) -> Vec<f64> {
         let k_f = k as f64;
         let s = c * (k_f / delta).ln() * k_f.sqrt(); // The "spike" parameter S
-        let r_boundary = (k_f / s).round() as usize; // Location of the spike
+        let r_boundary = (k_f / s).floor().max(1.0) as usize; // Location of the spike
 
         let mut cdf = vec![0.0f64; k + 1];
         let mut sum_rho_plus_tau = 0.0;
