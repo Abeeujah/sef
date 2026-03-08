@@ -1,3 +1,4 @@
+use std::io::{BufWriter, Write};
 use std::{ops::ControlFlow, path::Path, time::Instant};
 
 #[cfg(not(feature = "kernel"))]
@@ -46,6 +47,10 @@ pub fn run(
     let mut total_droplet_bytes = 0u64;
     let mut total_source_bytes = 0u64;
 
+    // Reusable buffers across epochs - grown once, never shrunk
+    let mut indices_buf: Vec<u32> = Vec::with_capacity(64);
+    let mut payload_buf: Vec<u8> = Vec::new();
+
     for_each_epoch(&*source, cfg.k, cfg.buffer, &mut |batch| {
         let epoch_idx = batch.index;
         let epoch_k = batch.blocks.len();
@@ -93,18 +98,39 @@ pub fn run(
             std::fs::write(&manifest_path, manifest_bytes).map_err(ChainError::from)?;
         }
 
+        // Ensure payload buffer is large enough for the longest source unit
+        let max_block_len = source_units.iter().map(|s| s.len()).max().unwrap_or(0);
+        if payload_buf.len() < max_block_len {
+            payload_buf.resize(max_block_len, 0);
+        }
+
         let epoch_start = Instant::now();
         let mut epoch_droplet_bytes = 0u64;
 
-        for droplet_id in 0..epoch_n {
-            let droplet = encoder.generate(droplet_id);
-            let filename = encode::droplet_filename(epoch_idx as u64, droplet_id);
-            let filepath = epoch_dir.join(&filename);
-            encode::write_droplet_file(&filepath, &droplet).map_err(ChainError::from)?;
+        // Write all droplets into a single append-only file per epoch
+        let droplets_path = epoch_dir.join("droplets.bin");
+        let file = std::fs::File::create(&droplets_path).map_err(ChainError::from)?;
+        let mut writer = BufWriter::with_capacity(1 << 20, file);
 
-            epoch_droplet_bytes += droplet.payload.len() as u64;
+        for droplet_id in 0..epoch_n {
+            let (_degree, padded_len) =
+                encoder.generate_into(droplet_id, &mut indices_buf, &mut payload_buf);
+
+            encode::encode_droplet_from_parts(
+                &mut writer,
+                epoch_idx as u64,
+                droplet_id,
+                &indices_buf,
+                padded_len,
+                &payload_buf[..padded_len as usize],
+            )
+            .map_err(|e| ChainError::Io(std::io::Error::other(e)))?;
+
+            epoch_droplet_bytes += padded_len as u64;
             total_droplets += 1;
         }
+
+        writer.flush().map_err(ChainError::from)?;
 
         total_droplet_bytes += epoch_droplet_bytes;
 
@@ -141,6 +167,10 @@ pub fn run(
         );
     }
     println!("  Total time:         {:.2}s", total_elapsed.as_secs_f64());
+    println!(
+        "  Throughput:         {:.1} MB/s",
+        total_source_bytes as f64 / total_elapsed.as_secs_f64() / 1e6
+    );
     println!(
         "  Output directory:   {}",
         output
