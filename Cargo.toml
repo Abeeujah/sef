@@ -11,7 +11,7 @@ rand = "0.8"
 rand_chacha = "0.3"
 sha2 = "0.10"
 clap = { version = "4", features = ["derive"] }
-bitcoinkernel = { version = "0.1", optional = true }
+bitcoinkernel = { version = "0.2", optional = true }
 bitcoin = { version = "0.32", features = ["std"] }
 
 [features]

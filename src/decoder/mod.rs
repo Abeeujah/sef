@@ -17,10 +17,15 @@
 //!
 //! - **Depends on:** [`crate::droplet`], [`crate::xor`]
 
-use std::{collections::VecDeque, fmt};
+mod bitcoin_block;
+mod superblock;
+mod symbol;
 
-use bitcoin::consensus::deserialize_partial;
-use sha2::{Digest, Sha256};
+pub use bitcoin_block::BitcoinBlockVerifier;
+pub use superblock::BitcoinSuperblockVerifier;
+pub use symbol::SymbolVerifier;
+
+use std::{collections::VecDeque, fmt};
 
 use crate::{droplet::Droplet, xor};
 
@@ -212,177 +217,6 @@ pub trait BlockVerifier {
     /// - `Err(VerifyError)`: The data is corrupted or does not match the
     ///   expected block for this index.
     fn verify_and_len(&self, block_idx: u32, candidate: &[u8]) -> Result<usize, VerifyError>;
-}
-
-/// SeF-secure [`BlockVerifier`] for raw-block-mode decoding.
-///
-/// Verifies recovered singletons against trusted block headers from an
-/// independently obtained header chain, matching the SeF paper's §3.2.3
-/// adverserial model. Each recovered block is validated by:
-///
-/// 1. Parsing the candidate as a `bitcoin::Block`
-/// 2. Checking its header matches the trusted header (hash comparison)
-/// 3. Recomputing the Merkle root from recovered transactions
-/// 4. Verifying the recomputed root matches the header's `merkle_root`
-///
-/// This prevents both header-only and payload-only forgeries from
-/// propagating through the peeling decoder.
-pub struct BitcoinBlockVerifier {
-    /// Trusted block headers, ordered by source block index within the epoch.
-    /// Obtained independently from the header chain (e.g., SPV, full node).
-    pub trusted_headers: Vec<bitcoin::block::Header>,
-}
-
-impl BlockVerifier for BitcoinBlockVerifier {
-    fn verify_and_len(&self, block_idx: u32, candidate: &[u8]) -> Result<usize, VerifyError> {
-        let (block, used): (bitcoin::Block, usize) =
-            deserialize_partial(candidate).map_err(|e| VerifyError::Deserialize(e.to_string()))?;
-
-        let expected = &self.trusted_headers[block_idx as usize];
-
-        // §3.2.3: Check header hash against trusted header chain
-        if block.block_hash() != expected.block_hash() {
-            return Err(VerifyError::HashMismatch {
-                block_idx,
-                expected: expected.block_hash().to_string(),
-                got: block.block_hash().to_string(),
-            });
-        }
-
-        // §3.2.3: Recompute Merkle root from recovered transactions
-        let computed_root = block.compute_merkle_root();
-        let expected_root = expected.merkle_root;
-        match computed_root {
-            Some(root) if root == expected_root => {}
-            _ => {
-                return Err(VerifyError::MerkleMismatch {
-                    block_idx,
-                    expected: expected_root.to_string(),
-                    got: computed_root.map_or("(empty block)".into(), |r| r.to_string()),
-                });
-            }
-        }
-
-        if candidate[used..].iter().any(|&b| b != 0) {
-            return Err(VerifyError::NonZeroPadding);
-        }
-
-        Ok(used)
-    }
-}
-
-/// [`BlockVerifier`] for symbol-mode decoding.
-///
-/// Verifies fixed-size symbols against a pre-computed SHA-256 hash manifest
-/// (see [`SymbolManifest`](crate::symbol::SymbolManifest)).  Each candidate
-/// is hashed and compared to `symbol_hashes[block_idx]`.
-pub struct SymbolVerifier<'a> {
-    /// Expected byte length of every symbol.
-    pub symbol_size: usize,
-    /// SHA-256 digests indexed by source block position.
-    pub symbol_hashes: &'a [[u8; 32]],
-}
-
-impl BlockVerifier for SymbolVerifier<'_> {
-    fn verify_and_len(&self, block_idx: u32, candidate: &[u8]) -> Result<usize, VerifyError> {
-        let expected = self.symbol_hashes.get(block_idx as usize).ok_or_else(|| {
-            VerifyError::Deserialize(format!("symbol index {} out of range", block_idx))
-        })?;
-
-        let got: [u8; 32] = Sha256::new().chain_update(candidate).finalize().into();
-        if got != *expected {
-            return Err(VerifyError::HashMismatch {
-                block_idx,
-                expected: expected
-                    .iter()
-                    .map(|b| format!("{:02x}", b))
-                    .collect::<String>(),
-                got: got.iter().map(|b| format!("{:02x}", b)).collect::<String>(),
-            });
-        }
-
-        if candidate.len() != self.symbol_size {
-            return Err(VerifyError::Deserialize(format!(
-                "symbol {} has length {}, expected {}",
-                block_idx,
-                candidate.len(),
-                self.symbol_size
-            )));
-        }
-
-        Ok(self.symbol_size)
-    }
-}
-
-/// SeF-secure [`BlockVerifier`] for superblock-mode decoding.
-///
-/// Verifies recovered superblock singletons against trusted block headers from
-/// an independently obtained header chain, matching the SeF paper's §3.2.3
-/// adverserial model.Each superblock contains consecutive whole Bitcoin blocks;
-/// verification parses them sequentially and validates every block's header
-/// hash AND recomputed Merkle root against the corresponding trusted header.
-///
-/// This prevents error propagation from murky (maliciously formed) droplets
-/// during peeling - the core security property of the SeF architecture.
-pub struct BitcoinSuperblockVerifier<'a> {
-    /// Trusted block headers from the independently obtained header chain,
-    /// indexed by block position within the epoch.
-    pub trusted_headers: &'a [bitcoin::block::Header],
-
-    /// Maps superblock index -> range of block indices within the epoch.
-    /// `ranges[i]` gives the block indices contained in superblock `i`.
-    pub ranges: &'a [std::ops::Range<usize>],
-}
-
-impl BlockVerifier for BitcoinSuperblockVerifier<'_> {
-    fn verify_and_len(&self, block_idx: u32, candidate: &[u8]) -> Result<usize, VerifyError> {
-        let range = self.ranges.get(block_idx as usize).ok_or_else(|| {
-            VerifyError::Deserialize(format!("superblock index {} out of range", block_idx))
-        })?;
-
-        let mut offset = 0;
-        for bi in range.clone() {
-            let (block, used): (bitcoin::Block, usize) = deserialize_partial(&candidate[offset..])
-                .map_err(|e| {
-                    VerifyError::Deserialize(format!(
-                        "superblock {}, block {}: {}",
-                        block_idx, bi, e
-                    ))
-                })?;
-
-            let expected = self.trusted_headers.get(bi).ok_or_else(|| {
-                VerifyError::Deserialize(format!("block index {} out of range", bi))
-            })?;
-
-            if block.block_hash() != expected.block_hash() {
-                return Err(VerifyError::HashMismatch {
-                    block_idx: bi as u32,
-                    expected: expected.block_hash().to_string(),
-                    got: block.block_hash().to_string(),
-                });
-            }
-
-            let computed_root = block.compute_merkle_root();
-            match computed_root {
-                Some(root) if root == expected.merkle_root => {}
-                _ => {
-                    return Err(VerifyError::MerkleMismatch {
-                        block_idx: bi as u32,
-                        expected: expected.merkle_root.to_string(),
-                        got: computed_root.map_or("(empty block)".into(), |r| r.to_string()),
-                    });
-                }
-            }
-
-            offset += used;
-        }
-
-        if candidate[offset..].iter().any(|&b| b != 0) {
-            return Err(VerifyError::NonZeroPadding);
-        }
-
-        Ok(offset)
-    }
 }
 
 /// Represents the termination state of the peeling decoder.
