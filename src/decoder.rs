@@ -9,17 +9,15 @@
 //!   [`BlockVerifier`] verification.
 //!
 //! Verification is pluggable via the [`BlockVerifier`] trait, with concrete
-//! implementations for Bitcoin blocks ([`BitcoinBlockVerifier`]) and
+//! implementations for Bitcoin blocks ([`BitcoinBlockVerifier`]),
+//! superblock-mode decoding ([`BitcoinSuperblockVerifier`]), and
 //! symbol-mode decoding ([`SymbolVerifier`]).
 //!
 //! # Dependency graph
 //!
 //! - **Depends on:** [`crate::droplet`], [`crate::xor`]
 
-use std::{
-    collections::{HashMap, VecDeque},
-    fmt,
-};
+use std::{collections::VecDeque, fmt};
 
 use bitcoin::consensus::deserialize_partial;
 use sha2::{Digest, Sha256};
@@ -155,6 +153,14 @@ pub enum VerifyError {
         got: String,
     },
 
+    /// Integrity failure: the recomputed Merkle root from the recovered
+    /// transactions does not match the trusted header's `merkle_root`.
+    MerkleMismatch {
+        block_idx: u32,
+        expected: String,
+        got: String,
+    },
+
     /// Security/Sanity check: found non-zero data where zero-padding was expected.
     NonZeroPadding,
 }
@@ -170,6 +176,15 @@ impl fmt::Display for VerifyError {
             } => write!(
                 f,
                 "hash mismatch for block {}: expected {}, got {}",
+                block_idx, expected, got
+            ),
+            VerifyError::MerkleMismatch {
+                block_idx,
+                expected,
+                got,
+            } => write!(
+                f,
+                "merkle mismatch for block {}: expected {}, got {}",
                 block_idx, expected, got
             ),
             VerifyError::NonZeroPadding => write!(f, "non-zero padding bytes"),
@@ -199,15 +214,23 @@ pub trait BlockVerifier {
     fn verify_and_len(&self, block_idx: u32, candidate: &[u8]) -> Result<usize, VerifyError>;
 }
 
-/// Bitcoin-specific [`BlockVerifier`] implementation.
+/// SeF-secure [`BlockVerifier`] for raw-block-mode decoding.
 ///
-/// Uses a pre-calculated list of block hashes (e.g., from a trusted header
-/// chain) to validate XOR-peeling results.  `expected_hashes` **must** be
-/// ordered by source block index within the epoch, i.e.,
-/// `expected_hashes[i]` corresponds to source block $i$.
+/// Verifies recovered singletons against trusted block headers from an
+/// independently obtained header chain, matching the SeF paper's §3.2.3
+/// adverserial model. Each recovered block is validated by:
+///
+/// 1. Parsing the candidate as a `bitcoin::Block`
+/// 2. Checking its header matches the trusted header (hash comparison)
+/// 3. Recomputing the Merkle root from recovered transactions
+/// 4. Verifying the recomputed root matches the header's `merkle_root`
+///
+/// This prevents both header-only and payload-only forgeries from
+/// propagating through the peeling decoder.
 pub struct BitcoinBlockVerifier {
-    /// Expected `BlockHash`es, ordered by source block index within the epoch.
-    pub expected_hashes: Vec<bitcoin::BlockHash>,
+    /// Trusted block headers, ordered by source block index within the epoch.
+    /// Obtained independently from the header chain (e.g., SPV, full node).
+    pub trusted_headers: Vec<bitcoin::block::Header>,
 }
 
 impl BlockVerifier for BitcoinBlockVerifier {
@@ -215,15 +238,29 @@ impl BlockVerifier for BitcoinBlockVerifier {
         let (block, used): (bitcoin::Block, usize) =
             deserialize_partial(candidate).map_err(|e| VerifyError::Deserialize(e.to_string()))?;
 
-        let hash = block.block_hash();
-        let expected = &self.expected_hashes[block_idx as usize];
+        let expected = &self.trusted_headers[block_idx as usize];
 
-        if hash != *expected {
+        // §3.2.3: Check header hash against trusted header chain
+        if block.block_hash() != expected.block_hash() {
             return Err(VerifyError::HashMismatch {
                 block_idx,
-                expected: expected.to_string(),
-                got: hash.to_string(),
+                expected: expected.block_hash().to_string(),
+                got: block.block_hash().to_string(),
             });
+        }
+
+        // §3.2.3: Recompute Merkle root from recovered transactions
+        let computed_root = block.compute_merkle_root();
+        let expected_root = expected.merkle_root;
+        match computed_root {
+            Some(root) if root == expected_root => {}
+            _ => {
+                return Err(VerifyError::MerkleMismatch {
+                    block_idx,
+                    expected: expected_root.to_string(),
+                    got: computed_root.map_or("(empty block)".into(), |r| r.to_string()),
+                });
+            }
         }
 
         if candidate[used..].iter().any(|&b| b != 0) {
@@ -274,6 +311,77 @@ impl BlockVerifier for SymbolVerifier<'_> {
         }
 
         Ok(self.symbol_size)
+    }
+}
+
+/// SeF-secure [`BlockVerifier`] for superblock-mode decoding.
+///
+/// Verifies recovered superblock singletons against trusted block headers from
+/// an independently obtained header chain, matching the SeF paper's §3.2.3
+/// adverserial model.Each superblock contains consecutive whole Bitcoin blocks;
+/// verification parses them sequentially and validates every block's header
+/// hash AND recomputed Merkle root against the corresponding trusted header.
+///
+/// This prevents error propagation from murky (maliciously formed) droplets
+/// during peeling - the core security property of the SeF architecture.
+pub struct BitcoinSuperblockVerifier<'a> {
+    /// Trusted block headers from the independently obtained header chain,
+    /// indexed by block position within the epoch.
+    pub trusted_headers: &'a [bitcoin::block::Header],
+
+    /// Maps superblock index -> range of block indices within the epoch.
+    /// `ranges[i]` gives the block indices contained in superblock `i`.
+    pub ranges: &'a [std::ops::Range<usize>],
+}
+
+impl BlockVerifier for BitcoinSuperblockVerifier<'_> {
+    fn verify_and_len(&self, block_idx: u32, candidate: &[u8]) -> Result<usize, VerifyError> {
+        let range = self.ranges.get(block_idx as usize).ok_or_else(|| {
+            VerifyError::Deserialize(format!("superblock index {} out of range", block_idx))
+        })?;
+
+        let mut offset = 0;
+        for bi in range.clone() {
+            let (block, used): (bitcoin::Block, usize) = deserialize_partial(&candidate[offset..])
+                .map_err(|e| {
+                    VerifyError::Deserialize(format!(
+                        "superblock {}, block {}: {}",
+                        block_idx, bi, e
+                    ))
+                })?;
+
+            let expected = self.trusted_headers.get(bi).ok_or_else(|| {
+                VerifyError::Deserialize(format!("block index {} out of range", bi))
+            })?;
+
+            if block.block_hash() != expected.block_hash() {
+                return Err(VerifyError::HashMismatch {
+                    block_idx: bi as u32,
+                    expected: expected.block_hash().to_string(),
+                    got: block.block_hash().to_string(),
+                });
+            }
+
+            let computed_root = block.compute_merkle_root();
+            match computed_root {
+                Some(root) if root == expected.merkle_root => {}
+                _ => {
+                    return Err(VerifyError::MerkleMismatch {
+                        block_idx: bi as u32,
+                        expected: expected.merkle_root.to_string(),
+                        got: computed_root.map_or("(empty block)".into(), |r| r.to_string()),
+                    });
+                }
+            }
+
+            offset += used;
+        }
+
+        if candidate[offset..].iter().any(|&b| b != 0) {
+            return Err(VerifyError::NonZeroPadding);
+        }
+
+        Ok(offset)
     }
 }
 
@@ -401,8 +509,9 @@ pub fn peeling_decode(
     let mut droplet_payloads: Vec<Vec<u8>> = Vec::with_capacity(n);
     let mut droplet_disabled: Vec<bool> = Vec::with_capacity(n);
 
-    // Block index -> list of droplet indices that reference it
-    let mut block_to_droplets: HashMap<u32, Vec<usize>> = HashMap::new();
+    // Block index -> list of droplet indices that reference it.
+    // Dense Vec since indices are in [0, k); avoids HashMap hashing overhead.
+    let mut block_to_droplets: Vec<Vec<usize>> = vec![Vec::new(); k];
 
     for d in droplets {
         // Validate droplet structure: sorted unique indices in range, payload matches padded_len
@@ -414,13 +523,11 @@ pub fn peeling_decode(
             continue;
         }
         droplet_disabled.push(false);
+        let di = remaining_degree.len();
         let deg = d.indices.len() as u32;
         let xor = d.indices.iter().fold(0u32, |acc, &x| acc ^ x);
         for &idx in &d.indices {
-            block_to_droplets
-                .entry(idx)
-                .or_default()
-                .push(remaining_degree.len());
+            block_to_droplets[idx as usize].push(di);
         }
         remaining_degree.push(deg);
         xor_index.push(xor);
@@ -429,8 +536,8 @@ pub fn peeling_decode(
 
     // Queue of singleton droplets
     let mut queue: VecDeque<usize> = VecDeque::new();
-    for (di, rd) in remaining_degree.iter().enumerate() {
-        if *rd == 1 {
+    for (di, deg) in remaining_degree.iter().enumerate() {
+        if *deg == 1 {
             queue.push_back(di);
         }
     }
@@ -464,7 +571,8 @@ pub fn peeling_decode(
                 }
 
                 // Peel: XOR recovered block out of all droplets that reference it
-                if let Some(referencing) = block_to_droplets.remove(&block_idx) {
+                let referencing = std::mem::take(&mut block_to_droplets[block_idx as usize]);
+                {
                     for ref_di in referencing {
                         if ref_di == di || droplet_disabled[ref_di] {
                             continue;
@@ -500,12 +608,12 @@ pub fn peeling_decode(
 
     // Build failure analysis for undecoded blocks
     let mut failures = Vec::new();
-    for (i, dec) in decoded.iter().enumerate().take(k) {
-        if dec.is_none() {
-            let referenced_by = block_to_droplets
-                .get(&(i as u32))
-                .map(|v| v.iter().filter(|&&di| !droplet_disabled[di]).count())
-                .unwrap_or(0);
+    for i in 0..k {
+        if decoded[i].is_none() {
+            let referenced_by = block_to_droplets[i]
+                .iter()
+                .filter(|&&di| !droplet_disabled[di])
+                .count();
             failures.push(BlockFailure {
                 index: i as u32,
                 referenced_by,
@@ -532,9 +640,13 @@ pub fn peeling_decode(
 
 #[cfg(test)]
 mod tests {
-    use crate::xor::xor_bytes;
+    use crate::xor::xor_blocks;
 
     use super::*;
+
+    fn xor_bytes(a: &[u8], b: &[u8]) -> Vec<u8> {
+        xor_blocks(&[a, b])
+    }
 
     #[test]
     fn test_all_singletons() {
@@ -936,5 +1048,45 @@ mod tests {
         let result = peeling_decode(3, droplets, &verifier);
         assert!(result.is_success());
         assert_eq!(result.decoded_count, 3);
+    }
+
+    #[test]
+    fn last_block_is_not_dropped_on_completion() {
+        struct AcceptAll;
+        impl BlockVerifier for AcceptAll {
+            fn verify_and_len(&self, _idx: u32, c: &[u8]) -> Result<usize, VerifyError> {
+                Ok(c.len())
+            }
+        }
+
+        // Two blocks. One degree-2 droplet + one degree-1 droplet.
+        // Block 1 is only recoverable by peeling block 0 out of the degree-2 droplet,
+        // making it the *last* block decoded — the case the bug hit.
+        let b0 = vec![0xAAu8; 8];
+        let b1 = vec![0xBBu8; 8];
+        let xored: Vec<u8> = b0.iter().zip(b1.iter()).map(|(a, b)| a ^ b).collect();
+
+        let droplets = vec![
+            Droplet {
+                epoch_id: 0,
+                droplet_id: 0,
+                indices: vec![0],
+                padded_len: 8,
+                payload: b0.clone(),
+            },
+            Droplet {
+                epoch_id: 0,
+                droplet_id: 1,
+                indices: vec![0, 1],
+                padded_len: 8,
+                payload: xored,
+            },
+        ];
+
+        let result = peeling_decode(2, droplets, &AcceptAll);
+        assert_eq!(result.stop_reason, DecodeStopReason::Completed);
+        assert_eq!(result.decoded_count, 2);
+        // This is the assertion that would have failed before the fix
+        assert_eq!(result.blocks[1].as_deref(), Some(b1.as_slice()));
     }
 }

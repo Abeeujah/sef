@@ -23,6 +23,7 @@ pub fn dispatch(command: Commands) -> Result<(), Box<dyn std::error::Error>> {
             c,
             delta,
             symbol_size,
+            superblock_size,
         } => {
             let cfg = EpochConfig {
                 k,
@@ -31,6 +32,7 @@ pub fn dispatch(command: Commands) -> Result<(), Box<dyn std::error::Error>> {
                 c,
                 delta,
                 symbol_size,
+                superblock_size,
             };
             generate::run(&blocks_dir, &output, &cfg)?;
         }
@@ -38,8 +40,9 @@ pub fn dispatch(command: Commands) -> Result<(), Box<dyn std::error::Error>> {
             input,
             output,
             epoch,
+            no_verify,
         } => {
-            decode::run(&input, &output, epoch)?;
+            decode::run(&input, &output, epoch, no_verify)?;
         }
         Commands::ChainInfo { blocks_dir } => {
             chain_info::run(&blocks_dir)?;
@@ -53,6 +56,7 @@ pub fn dispatch(command: Commands) -> Result<(), Box<dyn std::error::Error>> {
             delta,
             epoch,
             symbol_size,
+            superblock_size,
         } => {
             let cfg = EpochConfig {
                 k,
@@ -61,6 +65,7 @@ pub fn dispatch(command: Commands) -> Result<(), Box<dyn std::error::Error>> {
                 c,
                 delta,
                 symbol_size,
+                superblock_size,
             };
             reconstruct::run(&blocks_dir, &cfg, epoch)?;
         }

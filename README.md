@@ -1,21 +1,25 @@
 # SeF — Secure Fountain Architecture for Blockchains
 
+[![Rust](https://img.shields.io/badge/rust-2024_edition-orange)](https://www.rust-lang.org/)
+[![arXiv](https://img.shields.io/badge/arXiv-1906.12140-b31b1b)](https://arxiv.org/abs/1906.12140)
+[![GitHub](https://img.shields.io/badge/github-abeeujah%2Fsef-24292e)](https://github.com/abeeujah/sef)
+
 A Rust implementation of the **Secure Fountain (SeF)** architecture from
 [Kadhe, Chung & Ramchandran (2019)](https://arxiv.org/abs/1906.12140),
 which uses Luby Transform (LT) fountain codes to slash blockchain storage
 costs by orders of magnitude.
 
-## The Idea
+## Why SeF?
 
 Full nodes today must store the entire blockchain — hundreds of gigabytes for
-Bitcoin, terabytes for high-throughput chains. **SeF** replaces archival full
-nodes with lightweight *droplet nodes*:
+Bitcoin, terabytes for high-throughput chains. SeF replaces archival full
+nodes with lightweight **droplet nodes**:
 
 1. The chain is partitioned into **epochs** of *k* blocks.
 2. Each epoch is fountain-encoded: blocks are XOR'd together according to
-   degrees sampled from the **Robust Soliton Distribution** to produce
+   degrees sampled from the **Robust Soliton Distribution**, producing
    *droplets* (coded blocks).
-3. Each droplet node stores only *s ≪ k* droplets per epoch.
+3. Each droplet node stores only **s ≪ k** droplets per epoch.
 4. A new node (*bucket node*) contacts a set of droplet nodes, unions their
    droplets, and runs the **error-resilient peeling decoder** to reconstruct
    the original blocks — even when some nodes supply adversarial *murky*
@@ -32,91 +36,196 @@ nodes.
 ## Architecture
 
 ```
-Bitcoin datadir (blk*.dat / bitcoinkernel)
-  │
-  ▼
-┌─────────────┐     ┌──────────────┐     ┌───────────────┐
-│ BlockSource  │────▶│ for_each_    │────▶│ blocks_to_    │
-│ (chain)      │     │ epoch(k,buf) │     │ symbols(sz)   │
-└─────────────┘     └──────────────┘     └───────┬───────┘
-                                                 │ symbols
-                                                 ▼
-                    ┌──────────────┐     ┌───────────────┐
-                    │ Encoder::    │◀────│ RobustSoliton │
-                    │ generate(id) │     │ (distribution)│
-                    └──────┬───────┘     └───────────────┘
-                           │ droplets
-                           ▼
-                    ┌──────────────┐
-                    │ Droplet files│  ← consensus-serialized to disk
-                    └──────┬───────┘
-                           │
-              ─── network / storage ───
-                           │
-                           ▼
-                    ┌──────────────┐     ┌───────────────┐
-                    │ peeling_     │────▶│ BlockVerifier  │
-                    │ decode(k,..) │     │ (hash check)   │
-                    └──────┬───────┘     └───────────────┘
-                           │
-                           ▼
-                    ┌──────────────┐
-                    │ symbols_to_  │────▶ Recovered blocks
-                    │ blocks()     │
-                    └──────────────┘
+                        ╔═══════════════════╗
+                        ║  Bitcoin datadir   ║
+                        ║  blk*.dat files    ║
+                        ╚════════╤══════════╝
+                                 │
+                                 ▼
+                        ┌───────────────────┐
+                        │   BlockSource     │  chain module
+                        │  (Kernel / Blk)   │  blk*.dat or bitcoinkernel
+                        └────────┬──────────┘
+                                 │ raw blocks
+                                 ▼
+                        ┌───────────────────┐
+                        │  for_each_epoch   │  epoch module
+                        │  (k, buffer)      │  partition into epochs of k blocks
+                        └────────┬──────────┘
+                                 │ Vec<Block> per epoch
+                                 ▼
+              ┌──────────────────┼──────────────────┐
+              │                  │                   │
+              ▼                  ▼                   ▼
+     ┌────────────────┐ ┌────────────────┐ ┌────────────────┐
+     │  Superblock    │ │  Raw blocks    │ │  Symbol mode   │
+     │  (default)     │ │  (passthrough) │ │  (--symbol-    │
+     │  --superblock- │ │                │ │   size N)      │
+     │  size N        │ │                │ │                │
+     │  ✓ SeF-secure  │ │  ✓ SeF-secure  │ │  ✗ NOT secure  │
+     └───────┬────────┘ └───────┬────────┘ └───────┬────────┘
+              └──────────────────┼──────────────────┘
+                                 │ source units
+                                 ▼
+    ┌───────────────┐   ┌───────────────────┐
+    │ RobustSoliton │──▶│     Encoder       │  droplet module
+    │ (k, c, δ)     │   │  generate_into()  │  sample degree, XOR units
+    └───────────────┘   └────────┬──────────┘
+                                 │ Droplets
+                                 ▼
+                        ┌───────────────────┐
+                        │  encode module    │  consensus-serialize
+                        │  droplets.bin     │  + headers.bin
+                        │  + manifests      │  + superblock.bin / manifest.bin
+                        └────────┬──────────┘
+                                 │
+                    ═══ network / storage ═══
+                                 │
+                                 ▼
+                        ┌───────────────────┐
+                        │  peeling_decode   │  decoder module
+                        │  (k, droplets,    │  iterative singleton resolution
+                        │   verifier)       │
+                        └────────┬──────────┘
+                                 │          ┌───────────────────┐
+                                 ├─────────▶│  BlockVerifier    │
+                                 │  verify  │  • header hash    │
+                                 │  each    │  • Merkle root    │
+                                 │  block   │  (per singleton)  │
+                                 │          └───────────────────┘
+                                 ▼
+              ┌──────────────────┼──────────────────┐
+              │                  │                   │
+              ▼                  ▼                   ▼
+     ┌────────────────┐ ┌────────────────┐ ┌────────────────┐
+     │ superblocks_   │ │ (identity)     │ │ symbols_to_    │
+     │ to_blocks()    │ │                │ │ blocks()       │
+     └───────┬────────┘ └───────┬────────┘ └───────┬────────┘
+              └──────────────────┼──────────────────┘
+                                 │
+                                 ▼
+                        ┌───────────────────┐
+                        │  Recovered blocks │  written as blk*.dat
+                        │  (blk00000.dat …) │
+                        └───────────────────┘
 ```
 
-## Modules
+## Getting Started
 
-| Module         | Purpose |
-|----------------|---------|
-| `chain`        | Bitcoin block readers (`blk*.dat` and `bitcoinkernel` backends). |
-| `decoder`      | Peeling decoder with pluggable block verification. |
-| `distribution` | Robust Soliton Distribution (RSD) for degree sampling. |
-| `droplet`      | `Droplet` struct, `EpochParams`, and `Encoder`. |
-| `encode`       | Bitcoin consensus serialization and file I/O for droplets. |
-| `epoch`        | Epoch configuration, seed derivation, auto-scaling heuristics. |
-| `experiment`   | Storage-reduction simulations (graph-only, no XOR payloads). |
-| `symbol`       | Fixed-size symbol normalization and `SymbolManifest`. |
-| `xor`          | Bitwise XOR with adaptive zero-padding. |
+### Prerequisites
 
-## Quick Start
+- **Rust 2024 edition** (nightly or stable ≥ 1.85)
+- A Bitcoin Core datadir with `blk*.dat` files (e.g. signet for testing)
+- *(Optional)* [`bitcoinkernel`](https://crates.io/crates/bitcoinkernel) C library for validated block access
+
+### Build
 
 ```bash
-# Build (bitcoinkernel feature is enabled by default)
+# Default build (with bitcoinkernel support)
 cargo build --release
 
-# Build without bitcoinkernel (uses raw blk*.dat parsing)
+# Without bitcoinkernel (falls back to raw blk*.dat parsing)
 cargo build --release --no-default-features
+
+# Run tests
+cargo test
 ```
 
-### CLI Commands
+## CLI Reference
+
+### `sef dist-info` — Distribution Statistics
+
+Print Robust Soliton Distribution statistics for given parameters.
 
 ```bash
-# Show Robust Soliton Distribution statistics
 sef dist-info --k 1000 --c 0.1 --delta 0.05
+```
 
-# Display chain info from a Bitcoin data directory
+### `sef chain-info` — Inspect a Bitcoin Datadir
+
+Display block count and metadata from a Bitcoin data directory.
+
+```bash
 sef chain-info --blocks-dir ~/.bitcoin/signet/blocks
+```
 
-# Generate fountain-coded droplets from signet
+### `sef generate` — Encode Blocks into Droplets
+
+Fountain-encode blockchain epochs and write droplet files to disk. The
+`generate` command also persists trusted headers (`headers.bin`) alongside
+droplets for later verified decoding.
+
+```bash
+# Superblock mode (SeF-secure, default)
 sef generate --blocks-dir ~/.bitcoin/signet/blocks --output droplets/ \
-    --k 100 --symbol-size 4096
+    --k 10000 --superblock-size 5000000
 
-# Decode droplets back into blk*.dat files
+# Symbol mode (NOT SeF-secure)
+sef generate --blocks-dir ~/.bitcoin/signet/blocks --output droplets/ \
+    --k 100 --symbol-size 4096 --superblock-size 0
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--blocks-dir` | *(required)* | Path to Bitcoin `blocks/` directory |
+| `--output` | `droplets` | Output directory for droplet files |
+| `--k` | `100` | Epoch size (source blocks per epoch) |
+| `--n` | `0` (auto) | Droplets per epoch; `0` = auto-scale to 2× source count |
+| `--buffer` | `10` | Recent blocks excluded from encoding (confirmation window) |
+| `--c` | `0.1` | RSD tuning constant |
+| `--delta` | `0.05` | Tolerable failure probability |
+| `--symbol-size` | `0` (off) | Fixed symbol size in bytes; non-zero enables symbol mode |
+| `--superblock-size` | `10000000` | Target superblock size in bytes; `0` disables superblock grouping |
+
+### `sef decode` — Recover Blocks from Droplets
+
+Reconstruct source blocks from droplet files, optionally verifying each
+recovered block against trusted headers.
+
+```bash
+# Decode all epochs (verified)
 sef decode --input droplets/ --output decoded/
 
 # Decode a single epoch
 sef decode --input droplets/ --output decoded/ --epoch 42
 
-# End-to-end encode → decode → verify round-trip
-sef reconstruct --blocks-dir ~/.bitcoin/signet/blocks --k 100
+# Skip header verification (NOT SeF-secure)
+sef decode --input droplets/ --output decoded/ --no-verify
+```
 
-# Run the storage reduction experiment from the paper
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--input` | `droplets` | Directory containing `epoch_N/` subdirectories |
+| `--output` | `decoded` | Output directory for recovered block files |
+| `--epoch` | *(all)* | Decode only this epoch index |
+| `--no-verify` | `false` | Skip block verification (not SeF-secure) |
+
+### `sef reconstruct` — End-to-End Round-Trip
+
+Encode → decode → verify in one shot, useful for testing and validation.
+
+```bash
+sef reconstruct --blocks-dir ~/.bitcoin/signet/blocks --k 100
+```
+
+### `sef experiment` — Storage Reduction Simulation
+
+Run the graph-only storage reduction experiment from the paper (no XOR
+payloads, fast).
+
+```bash
 sef experiment --k 100 --trials 500
 ```
 
-### Library Usage
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--k` | `100` | Epoch size |
+| `--c` | `0.1` | RSD tuning constant |
+| `--delta` | `0.05` | Failure probability |
+| `--pool-size` | `500` | Total droplet pool size |
+| `--trials` | `500` | Number of trials per configuration |
+
+## Library Usage
 
 ```rust
 use sef::distribution::RobustSoliton;
@@ -132,7 +241,7 @@ let params = EpochParams::new(0, k as u32, [0u8; 32]);
 let dist = RobustSoliton::new(k, 0.1, 0.05);
 let encoder = Encoder::new(&params, &dist, &blocks);
 
-// Generate 3x overhead droplets
+// Generate 3× overhead droplets
 let droplets = encoder.generate_n((k as u64) * 3);
 
 // Verify recoverability via the peeling check
@@ -141,22 +250,55 @@ let result = peeling_check(k, &indices);
 assert!(result.success);
 ```
 
+## Modules
+
+| Module | Purpose |
+|--------|---------|
+| `chain` | Bitcoin block readers — raw `blk*.dat` parser and `bitcoinkernel`-backed reader. |
+| `decoder` | Peeling decoder with pluggable `BlockVerifier` trait (Bitcoin, superblock, symbol modes). |
+| `distribution` | `DegreeDistribution` trait and Robust Soliton Distribution (RSD) implementation. |
+| `droplet` | `Droplet` struct, `EpochParams`, and `Encoder` for fountain code generation. |
+| `encode` | Bitcoin consensus serialization and file I/O for droplet persistence. |
+| `epoch` | `EpochConfig`, deterministic seed derivation, and auto-scaling heuristics. |
+| `experiment` | Storage-reduction simulations (graph-only, no XOR payloads). |
+| `superblock` | Groups consecutive blocks into verifiable superblock source units. |
+| `symbol` | Fixed-size symbol slicing and `SymbolManifest` for reassembly (**not SeF-secure**). |
+| `xor` | Bitwise XOR with adaptive zero-padding. |
+
 ## Feature Flags
 
-| Flag     | Default | Description |
-|----------|---------|-------------|
+| Flag | Default | Description |
+|------|---------|-------------|
 | `kernel` | **yes** | Enables `KernelBlockReader` backed by `bitcoinkernel` for validated block access from a Bitcoin Core datadir. |
+
+## Security Model
+
+The SeF paper's core security property: during peeling decode, every
+recovered singleton is verified against the **independently obtained trusted
+header chain** before being accepted. This prevents murky (adversarial)
+droplets from propagating errors through the decode graph.
+
+Verification checks both the block header hash **and** the recomputed Merkle
+root of the recovered transactions against the trusted header, ensuring
+neither header-only nor payload-only forgeries can pass.
+
+| Mode | SeF-secure? | Verification |
+|------|-------------|--------------|
+| **Superblock** | ✓ Yes | Header hash + Merkle root per constituent block |
+| **Raw blocks** | ✓ Yes | Header hash + Merkle root per block |
+| **Symbol** | ✗ No | SHA-256 manifest hashes (requires trusted manifest) |
 
 ## Key Parameters
 
 | Parameter | Typical | Role |
 |-----------|---------|------|
-| `k`       | 100–10000 | Epoch size — number of source blocks per epoch. |
-| `s`       | 5–50    | Droplets stored per node; γ = k/s is the storage reduction factor. |
-| `c`       | 0.1     | RSD tuning constant controlling the degree-1 spike. |
-| `δ`       | 0.05    | Tolerable decoding failure probability. |
-| `symbol_size` | 4096 | Fixed symbol size in bytes for block concatenation (0 = disabled). |
-| `buffer`  | 10      | Recent blocks excluded from encoding (confirmation window). |
+| `k` | 100–10,000 | Epoch size — number of source blocks per epoch. |
+| `s` | 5–50 | Droplets stored per node; γ = k/s is the storage reduction factor. |
+| `c` | 0.1 | RSD tuning constant controlling the degree-1 spike. |
+| `δ` | 0.05 | Tolerable decoding failure probability. |
+| `superblock_size` | 10 MB | Target superblock byte size for SeF-secure encoding. |
+| `symbol_size` | 4096 | Fixed symbol size in bytes (symbol mode only, not SeF-secure). |
+| `buffer` | 10 | Recent blocks excluded from encoding (confirmation window). |
 
 ## References
 

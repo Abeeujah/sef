@@ -1,8 +1,8 @@
 use std::{io::Write, path::Path, time::Instant};
 
 use sef::{
-    decoder::{self, SymbolVerifier},
-    encode, symbol,
+    decoder::{self, BitcoinBlockVerifier, BitcoinSuperblockVerifier, SymbolVerifier},
+    encode, superblock, symbol,
 };
 
 /// Bitcoin signet network magic bytes.
@@ -11,10 +11,18 @@ const SIGNET_MAGIC: [u8; 4] = [0x0a, 0x03, 0xcf, 0x40];
 /// Maximum size of a single blk*.dat file (~128 MiB, matching Bitcoin Core).
 const MAX_BLK_FILE_SIZE: u64 = 128 * 1024 * 1024;
 
+struct AcceptAllVerifier;
+impl decoder::BlockVerifier for AcceptAllVerifier {
+    fn verify_and_len(&self, _idx: u32, candidate: &[u8]) -> Result<usize, decoder::VerifyError> {
+        Ok(candidate.len())
+    }
+}
+
 pub fn run(
     input: &Path,
     output: &Path,
     epoch_filter: Option<usize>,
+    no_verify: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Fountain Code Decode ===\n");
     println!("Reading droplets from: {}", input.display());
@@ -25,14 +33,12 @@ pub fn run(
         let entry = entry?;
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
-        if entry.file_type()?.is_dir() {
-            if let Some(idx_str) = name_str.strip_prefix("epoch_") {
-                if let Ok(idx) = idx_str.parse::<usize>() {
-                    if epoch_filter.is_none() || epoch_filter == Some(idx) {
-                        epoch_dirs.push((idx, entry.path()));
-                    }
-                }
-            }
+        if entry.file_type()?.is_dir()
+            && let Some(idx_str) = name_str.strip_prefix("epoch_")
+            && let Ok(idx) = idx_str.parse::<usize>()
+            && (epoch_filter.is_none() || epoch_filter == Some(idx))
+        {
+            epoch_dirs.push((idx, entry.path()));
         }
     }
     epoch_dirs.sort_by_key(|(idx, _)| *idx);
@@ -64,21 +70,19 @@ pub fn run(
     };
 
     for (epoch_idx, epoch_dir) in &epoch_dirs {
-        let manifest_path = epoch_dir.join("manifest.bin");
-        if !manifest_path.exists() {
-            println!("  Epoch {:3}: skipping (no manifest.bin)", epoch_idx);
-            continue;
-        }
+        let sym_manifest_path = epoch_dir.join("manifest.bin");
+        let sb_manifest_path = epoch_dir.join("superblock.bin");
+        let headers_path = epoch_dir.join("headers.bin");
 
-        let manifest_bytes = std::fs::read(&manifest_path)?;
-        let manifest = symbol::deserialize_manifest(&manifest_bytes)
-            .map_err(|e| format!("epoch {}: bad manifest: {}", epoch_idx, e))?;
+        // Determine encoding mode from which metadata file is present
+        let is_superblock = sb_manifest_path.exists();
+        let is_symbol = sym_manifest_path.exists();
+        let has_headers = headers_path.exists();
 
-        let k = manifest.total_symbols;
-        if k < 2 {
+        if !is_superblock && !is_symbol && !has_headers {
             println!(
-                "  Epoch {:3}: skipping (only {} symbols in manifest)",
-                epoch_idx, k
+                "  Epoch {:3}: skipping (no manifest.bin, superblock.bin, or headers.bin)",
+                epoch_idx
             );
             continue;
         }
@@ -113,72 +117,224 @@ pub fn run(
 
         let t_dec = Instant::now();
 
-        let sym_verifier = SymbolVerifier {
-            symbol_size: manifest.symbol_size,
-            symbol_hashes: &manifest.symbol_hashes,
-        };
-        let result = decoder::peeling_decode(k, droplets, &sym_verifier);
-        let decode_time = t_dec.elapsed();
+        let (
+            recovered_blocks,
+            num_blocks,
+            k,
+            result_decoded_count,
+            result_verify_failures,
+            result_failures,
+            verify_label,
+        ) = if is_superblock {
+            // --- Superblock mode ---
+            let sb_bytes = std::fs::read(&sb_manifest_path)?;
+            let sb_manifest = superblock::deserialize_manifest(&sb_bytes)
+                .map_err(|e| format!("epoch {}: bad superblock.bin: {}", epoch_idx, e))?;
 
-        let num_blocks = manifest.block_entries.len();
-
-        if result.is_success() {
-            let sym_opts: Vec<Option<Vec<u8>>> = result.blocks.into_iter().collect();
-            let recovered_blocks = symbol::symbols_to_blocks(&sym_opts, &manifest);
-
-            let mut epoch_recovered = 0usize;
-            let mut epoch_bytes = 0u64;
-
-            for block_data in recovered_blocks.iter().flatten() {
-                // Rotate blk file if needed
-                if blk_file.is_none()
-                    || blk_file_bytes + block_data.len() as u64 + 8 > MAX_BLK_FILE_SIZE
-                {
-                    if let Some(ref mut f) = blk_file {
-                        f.flush()?;
-                    }
-                    blk_file = Some(open_next_blk(output, &mut blk_file_idx)?);
-                    blk_file_bytes = 0;
-                }
-
-                let writer = blk_file.as_mut().unwrap();
-                writer.write_all(&SIGNET_MAGIC)?;
-                writer.write_all(&(block_data.len() as u32).to_le_bytes())?;
-                writer.write_all(block_data)?;
-                blk_file_bytes += 8 + block_data.len() as u64;
-
-                epoch_recovered += 1;
-                epoch_bytes += block_data.len() as u64;
+            let k = sb_manifest.total_supers;
+            if k < 2 {
+                println!(
+                    "  Epoch {:3}: skipping (only {} superblocks in manifest)",
+                    epoch_idx, k
+                );
+                continue;
             }
 
-            total_blocks_recovered += epoch_recovered;
-            total_blocks_attempted += num_blocks;
-            total_recovered_bytes += epoch_bytes;
+            let ranges = superblock::ranges_from_manifest(&sb_manifest);
+            let num_blocks = sb_manifest.total_blocks;
 
+            if no_verify {
+                let result = decoder::peeling_decode(k, droplets, &AcceptAllVerifier);
+                let reassembled =
+                    superblock::superblocks_to_blocks(&result.blocks, &ranges, num_blocks);
+                let decoded = reassembled.iter().filter(|b| b.is_some()).count();
+                let vf = result.verify_failures;
+                let failures = result.failures;
+                (
+                    reassembled,
+                    num_blocks,
+                    k,
+                    decoded,
+                    vf,
+                    failures,
+                    "unverified",
+                )
+            } else if has_headers {
+                let hdr_bytes = std::fs::read(&headers_path)?;
+                let headers = superblock::deserialize_headers(&hdr_bytes)
+                    .map_err(|e| format!("epoch {}: bad headers.bin: {}", epoch_idx, e))?;
+                let verifier = BitcoinSuperblockVerifier {
+                    trusted_headers: &headers,
+                    ranges: &ranges,
+                };
+                let result = decoder::peeling_decode(k, droplets, &verifier);
+                let reassembled =
+                    superblock::superblocks_to_blocks(&result.blocks, &ranges, num_blocks);
+                let decoded = reassembled.iter().filter(|b| b.is_some()).count();
+                let vf = result.verify_failures;
+                let failures = result.failures;
+                (
+                    reassembled,
+                    num_blocks,
+                    k,
+                    decoded,
+                    vf,
+                    failures,
+                    "verified",
+                )
+            } else {
+                println!(
+                    "  Epoch {:3}: skipping (no headers.bin, use --no-verify for insecure decode)",
+                    epoch_idx
+                );
+                continue;
+            }
+        } else if is_symbol {
+            // --- Symbol mode ---
+            let manifest_bytes = std::fs::read(&sym_manifest_path)?;
+            let manifest = symbol::deserialize_manifest(&manifest_bytes)
+                .map_err(|e| format!("epoch {}: bad manifest: {}", epoch_idx, e))?;
+
+            let k = manifest.total_symbols;
+            if k < 2 {
+                println!(
+                    "  Epoch {:3}: skipping (only {} symbols in manifest)",
+                    epoch_idx, k
+                );
+                continue;
+            }
+
+            let sym_verifier = SymbolVerifier {
+                symbol_size: manifest.symbol_size,
+                symbol_hashes: &manifest.symbol_hashes,
+            };
+            let result = decoder::peeling_decode(k, droplets, &sym_verifier);
+            let num_blocks = manifest.block_entries.len();
+
+            let sym_opts: Vec<Option<Vec<u8>>> = result.blocks.into_iter().collect();
+            let reassembled = symbol::symbols_to_blocks(&sym_opts, &manifest);
+
+            let vf = result.verify_failures;
+            let failures = result.failures;
+
+            // Post-reassembly SeF verification: symbols can't be verified
+            // against the header chain during peeling (they don't align to
+            // block boundaries), so we verify reconstructed blocks afterwards.
+            let verify_label = if no_verify {
+                "unverified"
+            } else {
+                println!(
+                    "  Epoch {:3}: skipping (no headers.bin, use --no-verify for insecure decode)",
+                    epoch_idx
+                );
+                continue;
+            };
+
+            let decoded = reassembled.iter().filter(|b| b.is_some()).count();
+            (
+                reassembled,
+                num_blocks,
+                k,
+                decoded,
+                vf,
+                failures,
+                verify_label,
+            )
+        } else if has_headers {
+            // --- Raw mode with headers ---
+            let hdr_bytes = std::fs::read(&headers_path)?;
+            let headers = superblock::deserialize_headers(&hdr_bytes)
+                .map_err(|e| format!("epoch {}: bad headers.bin: {}", epoch_idx, e))?;
+            let k = headers.len();
+            if k < 2 {
+                println!(
+                    "  Epoch {:3}: skipping (only {} blocks from headers)",
+                    epoch_idx, k
+                );
+                continue;
+            }
+            let verifier = BitcoinBlockVerifier {
+                trusted_headers: headers,
+            };
+            let result = decoder::peeling_decode(k, droplets, &verifier);
+            let num_blocks = k;
+
+            let decoded = result.blocks.iter().filter(|b| b.is_some()).count();
+            let vf = result.verify_failures;
+            let failures = result.failures;
+            let blocks = result.blocks;
+            (blocks, num_blocks, k, decoded, vf, failures, "verified")
+        } else {
+            println!("  Epoch {:3}: skipping (no metadata files)", epoch_idx);
+            continue;
+        };
+
+        let decode_time = t_dec.elapsed();
+
+        let mut epoch_recovered = 0usize;
+        let mut epoch_bytes = 0u64;
+
+        for block_data in recovered_blocks.iter().flatten() {
+            if blk_file.is_none()
+                || blk_file_bytes + block_data.len() as u64 + 8 > MAX_BLK_FILE_SIZE
+            {
+                if let Some(ref mut f) = blk_file {
+                    f.flush()?;
+                }
+                blk_file = Some(open_next_blk(output, &mut blk_file_idx)?);
+                blk_file_bytes = 0;
+            }
+
+            let writer = blk_file.as_mut().unwrap();
+            writer.write_all(&SIGNET_MAGIC)?;
+            writer.write_all(&(block_data.len() as u32).to_le_bytes())?;
+            writer.write_all(block_data)?;
+            blk_file_bytes += 8 + block_data.len() as u64;
+
+            epoch_recovered += 1;
+            epoch_bytes += block_data.len() as u64;
+        }
+
+        total_blocks_recovered += epoch_recovered;
+        total_blocks_attempted += num_blocks;
+        total_recovered_bytes += epoch_bytes;
+
+        if epoch_recovered == num_blocks {
+            if verify_label == "unverified" {
+                println!(
+                    "  Epoch {:3}: ✓ OK (unverified) | {}/{} blocks | {} droplets | {:.1}KB | dec {:.1}ms",
+                    epoch_idx,
+                    epoch_recovered,
+                    num_blocks,
+                    num_droplets,
+                    epoch_bytes as f64 / 1024.0,
+                    decode_time.as_secs_f64() * 1000.0,
+                );
+            } else {
+                println!(
+                    "  Epoch {:3}: ✓ OK | {}/{} blocks | {} droplets | {:.1}KB | dec {:.1}ms",
+                    epoch_idx,
+                    epoch_recovered,
+                    num_blocks,
+                    num_droplets,
+                    epoch_bytes as f64 / 1024.0,
+                    decode_time.as_secs_f64() * 1000.0,
+                );
+            }
+        } else {
             println!(
-                "  Epoch {:3}: ✓ OK | {}/{} blocks | {} droplets | {:.1}KB | dec {:.1}ms",
+                "  Epoch {:3}: ✗ FAIL | {}/{} blocks decoded | {} droplets (k={}) | dec {:.1}ms | {} verify_fail",
                 epoch_idx,
-                epoch_recovered,
+                result_decoded_count,
                 num_blocks,
                 num_droplets,
-                epoch_bytes as f64 / 1024.0,
-                decode_time.as_secs_f64() * 1000.0,
-            );
-        } else {
-            total_blocks_attempted += num_blocks;
-
-            println!(
-                "  Epoch {:3}: ✗ FAIL | {}/{} symbols decoded | {} droplets | dec {:.1}ms | {} verify_fail",
-                epoch_idx,
-                result.decoded_count,
                 k,
-                num_droplets,
                 decode_time.as_secs_f64() * 1000.0,
-                result.verify_failures,
+                result_verify_failures,
             );
-            for f in &result.failures {
+            for f in &result_failures {
                 println!(
-                    "           symbol {:3}: referenced by {} remaining droplets",
+                    "           unit {:3}: referenced by {} remaining droplets",
                     f.index, f.referenced_by
                 );
             }

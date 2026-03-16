@@ -7,8 +7,7 @@
 //!
 //! [`for_each_epoch`] implements a sliding-window epoch grouper with a
 //! configurable buffer exclusion for recent blocks, keeping peak memory at
-//! *O*(*k* + *buffer*). For batch use where all blocks are already in memory,
-//! see [`group_into_epochs`].
+//! *O*(*k* + *buffer*).
 
 use std::{collections::VecDeque, ops::ControlFlow};
 
@@ -80,20 +79,6 @@ pub trait BlockSource {
         &self,
         visitor: &mut dyn FnMut(RawBlock) -> Result<ControlFlow<()>, ChainError>,
     ) -> Result<(), ChainError>;
-
-    /// Loads every block on the active chain into memory and returns them.
-    ///
-    /// This is a convenience wrapper around [`for_each_block`](Self::for_each_block).
-    /// It allocates *O*(*chain_size*) memory and should only be used for
-    /// testing or small chains.
-    fn read_all_blocks(&self) -> Result<Vec<RawBlock>, ChainError> {
-        let mut out = Vec::new();
-        self.for_each_block(&mut |b| {
-            out.push(b);
-            Ok(ControlFlow::Continue(()))
-        })?;
-        Ok(out)
-    }
 
     /// Collects [`ChainStats`] via a single streaming pass, without
     /// retaining any block data in memory.
@@ -190,73 +175,9 @@ pub fn for_each_epoch<S: BlockSource + ?Sized>(
     Ok(())
 }
 
-/// Groups a pre-loaded slice of blocks into epochs of size `k`.
-///
-/// The last epoch may contain fewer than `k` blocks (a "tail epoch").
-/// The most recent `buffer` blocks are excluded from encoding.
-///
-/// This function requires all blocks in memory. For production use, prefer
-/// [`for_each_epoch`] which streams blocks with *O*(*k* + *buffer*) memory.
-pub fn group_into_epochs(blocks: &[RawBlock], k: usize, buffer: usize) -> Vec<&[RawBlock]> {
-    if blocks.len() <= buffer {
-        return vec![];
-    }
-
-    let encodable = &blocks[..blocks.len() - buffer];
-    encodable.chunks(k).collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_group_into_epochs() {
-        let blocks: Vec<RawBlock> = (0..100)
-            .map(|i| RawBlock {
-                height: i,
-                hash: format!("hash_{}", i),
-                data: vec![i as u8; 10],
-            })
-            .collect();
-
-        // k=10, buffer=5 -> 95 encodable blocks -> 9 full epochs + 1 tail of 5
-        let epochs = group_into_epochs(&blocks, 10, 5);
-        assert_eq!(epochs.len(), 10);
-        assert_eq!(epochs[0].len(), 10);
-        assert_eq!(epochs[0][0].height, 0);
-        assert_eq!(epochs[9].len(), 5);
-        assert_eq!(epochs[9][0].height, 90);
-    }
-
-    #[test]
-    fn test_group_into_epochs_all_buffer() {
-        let blocks: Vec<RawBlock> = (0..10)
-            .map(|i| RawBlock {
-                height: i,
-                hash: format!("hash_{}", i),
-                data: vec![i as u8; 10],
-            })
-            .collect();
-
-        let epochs = group_into_epochs(&blocks, 5, 20);
-        assert!(epochs.is_empty());
-    }
-
-    #[test]
-    fn test_group_into_epochs_no_buffer() {
-        let blocks: Vec<RawBlock> = (0..25)
-            .map(|i| RawBlock {
-                height: i,
-                hash: format!("hash_{}", i),
-                data: vec![i as u8; 10],
-            })
-            .collect();
-
-        let epochs = group_into_epochs(&blocks, 10, 0);
-        assert_eq!(epochs.len(), 3);
-        assert_eq!(epochs[2].len(), 5);
-    }
 
     #[test]
     fn test_for_each_epoch_basic() {

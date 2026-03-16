@@ -58,12 +58,12 @@ pub fn run(
         let block_data: Vec<Vec<u8>> = batch.blocks.into_iter().map(|b| b.data).collect();
         let source_bytes: usize = block_data.iter().map(|b| b.len()).sum();
 
-        let expected_hashes: Vec<bitcoin::BlockHash> = block_data
+        let expected_hashes: Vec<bitcoin::block::Header> = block_data
             .iter()
             .map(|data| {
                 let block: bitcoin::Block = deserialize(data)
                     .map_err(|e| ChainError::Parse(format!("block parse failed: {e}")))?;
-                Ok(block.block_hash())
+                Ok(block.header)
             })
             .collect::<Result<Vec<_>, ChainError>>()?;
 
@@ -141,7 +141,7 @@ pub fn run(
             }
         } else {
             let verifier = BitcoinBlockVerifier {
-                expected_hashes: expected_hashes.clone(),
+                trusted_headers: expected_hashes.clone(),
             };
             let result = decoder::peeling_decode(epoch_k, droplets, &verifier);
             let success = result.is_success();

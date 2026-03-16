@@ -92,5 +92,6 @@ pub mod droplet;
 pub mod encode;
 pub mod epoch;
 pub mod experiment;
+pub mod superblock;
 pub mod symbol;
 pub mod xor;

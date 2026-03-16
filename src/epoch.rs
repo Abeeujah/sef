@@ -49,7 +49,21 @@ pub struct EpochConfig {
     /// [`symbol::blocks_to_symbols`](crate::symbol::blocks_to_symbols)
     /// normalization pass. Set to `0` to disable symbol slicing and encode
     /// raw variable-length blocks directly.
+    ///
+    /// **Not SeF-secure** against adverserial manifests. For adverserial
+    /// resistance, use `superblock_size` instead.
     pub symbol_size: usize,
+
+    /// Target superblock size in bytes for SeF-secure encoding (§5.1).
+    ///
+    /// When nonzero, consecutive blocks are greedily concatenated until
+    /// adding the next block would exceed this byte threshold, producing
+    /// approximately equal-sized superblocks that can be verified against
+    /// the header chain during peeling - providing the adverserial
+    /// resistance described in the SeF paper (§3.2.3).
+    /// Takes precedence over `symbol_size` when both are set.
+    /// Set to `0` to disable.
+    pub superblock_size: usize,
 }
 
 /// Derives a deterministic 256-bit epoch seed via SHA-256 domain separation.

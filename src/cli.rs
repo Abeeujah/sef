@@ -55,9 +55,13 @@ pub enum Commands {
         #[arg(long, default_value_t = 0.05)]
         delta: f64,
 
-        /// Symbol size in bytes for block concatenation (0 = disabled)
-        #[arg(long, default_value_t = 4096)]
+        /// Symbol size in bytes for block concatenation (0 = disabled, NOT SeF-secure)
+        #[arg(long, default_value_t = 0)]
         symbol_size: usize,
+
+        /// Target superblock size in bytes for SeF-secure encoding (0 = disabled)
+        #[arg(long, default_value_t = 10_000_000)]
+        superblock_size: usize,
     },
 
     /// Show info about blocks in a data directory
@@ -97,9 +101,13 @@ pub enum Commands {
         #[arg(long)]
         epoch: Option<usize>,
 
-        /// Symbol size in bytes for block concatenation (0 = disabled)
-        #[arg(long, default_value_t = 4096)]
+        /// Symbol size in bytes for block concatenation (0 = disabled, NOT SeF-secure)
+        #[arg(long, default_value_t = 0)]
         symbol_size: usize,
+
+        /// Target superblock size in bytes for SeF-secure encoding (0 = disabled)
+        #[arg(long, default_value_t = 10_000_000)]
+        superblock_size: usize,
     },
 
     /// Decode droplets back into source blocks
@@ -115,6 +123,10 @@ pub enum Commands {
         /// Only decode this epoch index (optional)
         #[arg(long)]
         epoch: Option<usize>,
+
+        /// Skip block verification during decode (NOT SeF-secure)
+        #[arg(long, default_value_t = false)]
+        no_verify: bool,
     },
 
     /// Print help information

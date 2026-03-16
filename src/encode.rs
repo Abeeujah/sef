@@ -4,8 +4,6 @@
 //! index vector and payload, producing a compact on-disk / on-wire
 //! representation suitable for storage and network transfer.
 //!
-//! Additionally exposes filesystem I/O helpers for persisting individual
-//! droplets to and from `.bin` files.
 //!
 //! # Dependency graph
 //!
@@ -72,13 +70,6 @@ impl Decodable for Droplet {
     }
 }
 
-/// Consensus-serializes the [`Droplet`] and writes the resulting bytes
-/// atomically to `path`.
-pub fn write_droplet_file(path: &std::path::Path, droplet: &Droplet) -> io::Result<()> {
-    let bytes = encode::serialize(droplet);
-    std::fs::write(path, bytes)
-}
-
 /// Reads raw bytes from `path` and consensus-deserializes them into a
 /// [`Droplet`].
 ///
@@ -87,12 +78,6 @@ pub fn write_droplet_file(path: &std::path::Path, droplet: &Droplet) -> io::Resu
 pub fn read_droplet_file(path: &std::path::Path) -> io::Result<Droplet> {
     let bytes = std::fs::read(path)?;
     encode::deserialize(&bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-}
-
-/// Produces the canonical filename for a droplet:
-/// `epoch_{epoch_id}_droplet_{droplet_id}.bin`.
-pub fn droplet_filename(epoch_id: u64, droplet_id: u64) -> String {
-    format!("epoch_{}_droplet_{}.bin", epoch_id, droplet_id)
 }
 
 /// Encodes a droplet directly from borrowed buffers, avoiding allocation.
@@ -193,31 +178,6 @@ mod tests {
         bytes.truncate(bytes.len() - 2);
         let result = encode::deserialize::<Droplet>(&bytes);
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_droplet_filename() {
-        assert_eq!(droplet_filename(0, 0), "epoch_0_droplet_0.bin");
-        assert_eq!(droplet_filename(5, 42), "epoch_5_droplet_42.bin");
-    }
-
-    #[test]
-    fn test_file_roundtrip() {
-        let dir = std::env::temp_dir().join("fountain_test");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("test_droplet.bin");
-
-        let original = sample_droplet();
-        write_droplet_file(&path, &original).unwrap();
-        let recovered = read_droplet_file(&path).unwrap();
-
-        assert_eq!(recovered.epoch_id, original.epoch_id);
-        assert_eq!(recovered.droplet_id, original.droplet_id);
-        assert_eq!(recovered.indices, original.indices);
-        assert_eq!(recovered.payload, original.payload);
-
-        std::fs::remove_file(&path).ok();
-        std::fs::remove_dir(&dir).ok();
     }
 
     #[test]

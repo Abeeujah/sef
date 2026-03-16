@@ -13,46 +13,46 @@
 //! Bitcoin blocks can be combined without pre-normalization.
 //!
 //! ```
-//! use sef::xor::xor_bytes;
+//! use sef::xor::xor_blocks;
 //!
 //! let a = vec![0xFF, 0x00];
 //! let b = vec![0x0F, 0xF0, 0x55]; // implicitly pads `a` with 0x00
-//! assert_eq!(xor_bytes(&a, &b), vec![0xF0, 0xF0, 0x55]);
+//! assert_eq!(xor_blocks(&[&a, &b]), vec![0xF0, 0xF0, 0x55]);
 //! ```
 
-/// XORs two byte slices with adaptive zero-padding, returning a new allocation.
+/// XORs `src[..src.len()]` into the prefix of `dst`, using word-width
+/// unaligned loads for throughput.
 ///
-/// Produces a `Vec<u8>` of length `max(a.len(), b.len())`. When the slices
-/// differ in length the shorter one is treated as if zero-padded, allowing
-/// variable-size blocks (e.g., metadata vs. payload) to be combined without
-/// prior normalization.
+/// # Safety contract (upheld internally)
 ///
-/// Primarily used during encoding to combine pairs of source blocks.
-pub fn xor_bytes(a: &[u8], b: &[u8]) -> Vec<u8> {
-    let (short, long) = if a.len() < b.len() { (a, b) } else { (b, a) };
-    let mut result = long.to_vec();
+/// Caller must guarantee `src.len() <= dst.len()`. This is asserted in
+/// debug builds and assumed in release builds for elision of the bounds
+/// check inside the word loop.
+#[inline]
+fn xor_prefix_unchecked(dst: &mut [u8], src: &[u8]) {
+    debug_assert!(src.len() <= dst.len());
 
-    for (r, &s) in result.iter_mut().zip(short) {
-        *r ^= s;
+    const W: usize = std::mem::size_of::<u64>();
+    let len = src.len();
+    let tail_start = (len / W) * W;
+
+    let dst_ptr = dst.as_mut_ptr();
+    let src_ptr = src.as_ptr();
+
+    // Process full u64 words via unaligned reads/writes — no alignment UB.
+    for offset in (0..tail_start).step_by(W) {
+        // SAFETY: `offset + W <= len <= dst.len()` and `offset + W <= len`
+        // so both pointer ranges are in-bounds. `read_unaligned` /
+        // `write_unaligned` impose no alignment requirements.
+        unsafe {
+            let d = std::ptr::read_unaligned(dst_ptr.add(offset).cast::<u64>());
+            let s = std::ptr::read_unaligned(src_ptr.add(offset).cast::<u64>());
+            std::ptr::write_unaligned(dst_ptr.add(offset).cast::<u64>(), d ^ s);
+        }
     }
-    result
-}
 
-/// XORs `block` into `buf` in place, extending `buf` if `block` is longer.
-///
-/// Mutates `buf` by XORing each existing byte with the corresponding byte
-/// from `block`. If `block` is longer than `buf`, the surplus bytes are
-/// appended verbatim (equivalent to XOR with zero). This grow-on-demand
-/// behavior supports the encoder's accumulation loop where the running
-/// buffer starts empty and absorbs blocks of varying lengths.
-pub fn xor_into(buf: &mut Vec<u8>, block: &[u8]) {
-    let buf_len = buf.len();
-    let block_len = block.len();
-
-    buf.iter_mut().zip(block.iter()).for_each(|(b, &s)| *b ^= s);
-
-    if block_len > buf_len {
-        buf.extend_from_slice(&block[buf_len..]);
+    for i in tail_start..len {
+        dst[i] ^= src[i];
     }
 }
 
@@ -66,22 +66,8 @@ pub fn xor_into_fixed(dst: &mut [u8], src: &[u8]) -> bool {
     if src.len() > dst.len() {
         return false;
     }
-    for (d, &s) in dst[..src.len()].iter_mut().zip(src.iter()) {
-        *d ^= s;
-    }
+    xor_prefix_unchecked(dst, src);
     true
-}
-
-/// Folds source blocks into an existing buffer via XOR, avoiding allocation.
-///
-/// The caller must ensure `buf.len() >= max(blocks[i].len())`.
-/// The buffer is zeroed before XOR accumulation.
-/// The buffer is zeroed before XOR accumulation.
-pub fn xor_blocks_into(buf: &mut [u8], blocks: &[&[u8]]) {
-    buf.fill(0);
-    for block in blocks {
-        xor_block_into(buf, block);
-    }
 }
 
 /// Folds an arbitrary number of byte slices into a single XOR result.
@@ -96,31 +82,12 @@ pub fn xor_blocks_into(buf: &mut [u8], blocks: &[&[u8]]) {
 pub fn xor_blocks(blocks: &[&[u8]]) -> Vec<u8> {
     let max_len = blocks.iter().map(|b| b.len()).max().unwrap_or(0);
     let mut result = vec![0u8; max_len];
-    xor_blocks_into(&mut result, blocks);
+
+    for block in blocks {
+        xor_prefix_unchecked(&mut result, block);
+    }
+
     result
-}
-
-#[inline]
-fn xor_block_into(buf: &mut [u8], block: &[u8]) {
-    let len = block.len();
-    let chunks = len / 8;
-    let remainder = len % 8;
-
-    // SAFETY: both pointers are valid, aligned (u64 needs 8-byte alignment —
-    // upheld by the allocator for heap Vec/slice buffers), and non-overlapping.
-    let buf_u64: &mut [u64] =
-        unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr().cast::<u64>(), chunks) };
-    let block_u64: &[u64] =
-        unsafe { std::slice::from_raw_parts(block.as_ptr().cast::<u64>(), chunks) };
-
-    for (r, &b) in buf_u64.iter_mut().zip(block_u64) {
-        *r ^= b;
-    }
-
-    let tail_start = chunks * 8;
-    for i in 0..remainder {
-        buf[tail_start + i] ^= block[tail_start + i];
-    }
 }
 
 #[cfg(test)]
@@ -128,52 +95,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_xor_equal_length() {
-        let a = vec![0xFF, 0x00, 0xAA];
-        let b = vec![0x0F, 0xF0, 0x55];
-        let result = xor_bytes(&a, &b);
-        assert_eq!(result, vec![0xF0, 0xF0, 0xFF]);
-    }
-
-    #[test]
-    fn test_xor_different_lengths() {
-        let a = vec![0xFF, 0x00];
-        let b = vec![0x0F, 0xF0, 0x55];
-        let result = xor_bytes(&a, &b); // a gets padded with 0x00: [0xFF, 0x00, 0x00]
-        assert_eq!(result, vec![0xF0, 0xF0, 0x55]);
-    }
-
-    #[test]
-    fn test_xor_self_is_zero() {
-        let a = vec![0xDE, 0xAD, 0xBE, 0xEF];
-        let result = xor_bytes(&a, &a);
-        assert_eq!(result, vec![0, 0, 0, 0]);
-    }
-
-    #[test]
-    fn test_xor_with_zero() {
-        let a = vec![0xDE, 0xAD];
-        let zero = vec![0x00, 0x00];
-        let result = xor_bytes(&a, &zero);
-        assert_eq!(result, a);
-    }
-
-    #[test]
-    fn test_xor_into_extending() {
-        let mut buf = vec![0xFF, 0x00];
-        let block = vec![0x0F, 0xF0, 0xAA];
-        xor_into(&mut buf, &block);
-        assert_eq!(buf, vec![0xF0, 0xF0, 0xAA]);
-    }
-
-    #[test]
     fn test_xor_blocks_multiple() {
         let a = vec![0xFF, 0x00, 0xAA];
         let b = vec![0x0F, 0xF0];
         let c = vec![0x01, 0x02, 0x03, 0x04];
         let result = xor_blocks(&[&a, &b, &c]);
-        // a ^ b ^ c (with zero padding):
-        // [0xFF^0x0F^0x01, ..., 0x00^0x00^0x04]
         assert_eq!(result, vec![0xF1, 0xF2, 0xA9, 0x04]);
     }
 
@@ -191,23 +117,42 @@ mod tests {
     }
 
     #[test]
-    fn test_xor_is_commutative_with_different_lengths() {
-        let a = vec![0x12, 0x34, 0x56]; // 3 bytes
-        let b = vec![0x78]; // 1 byte
+    fn test_xor_blocks_unaligned_inputs() {
+        let mut a_backing = vec![0xAA];
+        a_backing.extend(0u8..17);
+        let mut b_backing = vec![0xBB];
+        b_backing.extend(17u8..34);
 
-        // This checks if (a ^ b_padded) == (b ^ a_padded)
-        assert_eq!(xor_bytes(&a, &b), xor_bytes(&b, &a));
+        let a = &a_backing[1..];
+        let b = &b_backing[1..];
+
+        let result_blocks = xor_blocks(&[a, b]);
+        let result_fixed = {
+            let mut dst = a.to_vec();
+            xor_into_fixed(&mut dst, b);
+            dst
+        };
+        assert_eq!(result_blocks, result_fixed);
     }
 
     #[test]
-    fn test_xor_is_associative_with_different_lengths() {
-        let a = vec![0x12];
-        let b = vec![0x56, 0x78];
-        let c = vec![0x9A, 0xBC, 0xDE];
+    fn test_xor_into_fixed_word_path() {
+        let mut dst_backing = vec![0xAA];
+        dst_backing.extend(0u8..17);
+        let mut src_backing = vec![0xBB];
+        src_backing.extend(17u8..34);
 
-        let ab_c = xor_bytes(&xor_bytes(&a, &b), &c);
-        let a_bc = xor_bytes(&a, &xor_bytes(&b, &c));
+        let original = dst_backing[1..].to_vec();
+        let src = &src_backing[1..];
 
-        assert_eq!(ab_c, a_bc);
+        assert!(xor_into_fixed(&mut dst_backing[1..], src));
+        assert_eq!(&dst_backing[1..], xor_blocks(&[&original, src]).as_slice());
+    }
+
+    #[test]
+    fn test_xor_into_fixed_rejects_oversized_src_without_mutating() {
+        let mut dst = vec![0x12, 0x34];
+        assert!(!xor_into_fixed(&mut dst, &[0xAA, 0xBB, 0xCC]));
+        assert_eq!(dst, vec![0x12, 0x34]);
     }
 }

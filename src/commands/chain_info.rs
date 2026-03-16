@@ -1,9 +1,9 @@
 use std::{path::Path, time::Instant};
 
-#[cfg(not(feature = "kernel"))]
-use sef::chain::blk_file_reader::BlkFileReader;
 #[cfg(feature = "kernel")]
 use sef::chain::KernelBlockReader;
+#[cfg(not(feature = "kernel"))]
+use sef::chain::blk_file_reader::BlkFileReader;
 use sef::chain::stream::BlockSource;
 
 pub fn run(blocks_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {

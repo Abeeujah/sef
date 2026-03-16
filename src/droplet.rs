@@ -241,13 +241,26 @@ impl<'e, D: DegreeDistribution> Encoder<'e, D> {
         indices_buf.extend(sample(&mut rng, k, degree).into_iter().map(|i| i as u32));
         indices_buf.sort_unstable();
 
-        let selected_blocks: Vec<&[u8]> = indices_buf
-            .iter()
-            .map(|&i| self.blocks[i as usize].as_slice())
-            .collect();
+        let mut padded_len = 0;
+        for &idx in indices_buf.iter() {
+            padded_len = padded_len.max(self.blocks[idx as usize].len());
+        }
 
-        let padded_len = selected_blocks.iter().map(|b| b.len()).max().unwrap_or(0);
-        xor::xor_blocks_into(&mut payload_buf[..padded_len], &selected_blocks);
+        assert!(
+            payload_buf.len() >= padded_len,
+            "payload_buf.len() ({}) < padded_len ({})",
+            payload_buf.len(),
+            padded_len
+        );
+
+        let dst = &mut payload_buf[..padded_len];
+        dst.fill(0);
+
+        for &idx in indices_buf.iter() {
+            let block = self.blocks[idx as usize].as_slice();
+            let ok = xor::xor_into_fixed(dst, block);
+            debug_assert!(ok);
+        }
 
         (degree, padded_len as u32)
     }
@@ -260,20 +273,6 @@ impl<'e, D: DegreeDistribution> Encoder<'e, D> {
 }
 
 impl Droplet {
-    /// Returns the degree of this droplet, representing the number of
-    /// source blocks XOR'd to create the current payload.
-    pub fn degree(&self) -> usize {
-        self.indices.len()
-    }
-
-    /// Returns `true` if this is a "singleton" (degree 1).
-    ///
-    /// Singletons are the entry points for the peeling decoder, as they
-    /// contain a raw, un-XOR'd source block that can be recovered immediately.
-    pub fn is_singleton(&self) -> bool {
-        self.indices.len() == 1
-    }
-
     /// Verifies the structural integrity of the droplet against the epoch's $K$ value.
     ///
     /// This ensures the droplet is decodable and won't cause panics during the
@@ -354,8 +353,7 @@ mod tests {
         let encoder = Encoder::new(&params, &AlwaysOne, &blocks);
         let droplet = encoder.generate(0);
 
-        assert_eq!(droplet.degree(), 1);
-        assert!(droplet.is_singleton());
+        assert_eq!(droplet.indices.len(), 1);
 
         // A singleton droplet's payload should equal the source block
         let idx = droplet.indices[0] as usize;
@@ -385,13 +383,12 @@ mod tests {
         let encoder = Encoder::new(&params, &AlwaysTwo, &blocks);
         let droplet = encoder.generate(0);
 
-        assert_eq!(droplet.degree(), 2);
-        assert!(!droplet.is_singleton());
+        assert_eq!(droplet.indices.len(), 2);
 
         // Verify: XOR of the two selected blocks should equal the payload
         let idx0 = droplet.indices[0] as usize;
         let idx1 = droplet.indices[1] as usize;
-        let expected = xor::xor_bytes(&blocks[idx0], &blocks[idx1]);
+        let expected = xor::xor_blocks(&[&blocks[idx0], &blocks[idx1]]);
         assert_eq!(droplet.payload, expected);
         assert!(droplet.validate(k as u32).is_ok());
     }
@@ -484,7 +481,7 @@ mod tests {
         let droplets = encoder.generate_n(500);
 
         for d in &droplets {
-            if d.is_singleton() {
+            if d.indices.len() == 1 {
                 let idx = d.indices[0] as usize;
                 // Payload should equal the source block
                 // (it may be longer if padded, but the original block is at the start)
