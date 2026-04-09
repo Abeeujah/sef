@@ -9,11 +9,30 @@ A Rust implementation of the **Secure Fountain (SeF)** architecture from
 which uses Luby Transform (LT) fountain codes to slash blockchain storage
 costs by orders of magnitude.
 
+Full nodes are the backbone of the Bitcoin network, they store the entire
+chain, validate every block, and keep the network honest. But that integrity
+comes at a cost: hundreds of gigabytes of storage that grows without bound,
+pricing out anyone without dedicated hardware. This creates a real tension:
+the more storage costs, the fewer people run full nodes, and the more 
+centralized (and vulnerable) the network becomes.
+
+Pruning addresses the storage problem but undermines the security guarantee.
+A pruned node that can't validate from its own state must request missing data
+from peers — and has no way to know if those peers are lying.
+
+This project implements a third path: using fountain codes to let a network of
+pruned nodes collectively serve as an archive. Each node stores only a small
+encoded fraction of the chain; any new node can reconstruct the full history by
+querying enough peers — and the block header chain provides the authenticated
+side-information needed to detect and reject malicious responses along the way.
+
+The result is archive-class availability at a fraction of the per-node storage
+cost, without weakening the trust model.
+
 ## Why SeF?
 
 Full nodes today must store the entire blockchain — hundreds of gigabytes for
-Bitcoin, terabytes for high-throughput chains. SeF replaces archival full
-nodes with lightweight **droplet nodes**:
+Bitcoin. SeF replaces archival full nodes with pruned nodes that can act as archives:
 
 1. The chain is partitioned into **epochs** of *k* blocks.
 2. Each epoch is fountain-encoded: blocks are XOR'd together according to
